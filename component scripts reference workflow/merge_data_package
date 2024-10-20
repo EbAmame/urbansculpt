@@ -1,0 +1,371 @@
+# Merge Data Package component
+
+# Required inputs:
+# 1. Multiple data packages (inherited from Block Analysis component, set input to list access)
+# 2. Random seed (integer)
+
+
+import random
+import math
+from collections import Counter
+
+######################################################
+
+# Functions
+
+def proportional_split(number, reference_list):
+    # Calculate the total sum of the reference list
+    reference_sum = sum(reference_list)
+    # Calculate the proportional values
+    new_list = [round((number * x) / reference_sum) for x in reference_list]
+    # Adjust to make sure the sum of the new list equals the target number
+    difference = number - sum(new_list)
+    # Distribute the remaining difference, if any, to the largest elements in the new list
+    for i in range(abs(difference)):
+        index_to_adjust = new_list.index(max(new_list)) if difference > 0 else new_list.index(min(new_list))
+        new_list[index_to_adjust] += 1 if difference > 0 else -1
+    return new_list
+
+# Function to calculate mean
+def calculate_mean(data):
+    return sum(data) / len(data)
+
+# Function to calculate standard deviation
+def calculate_std(data):
+    mean = calculate_mean(data)
+    squared_differences = [(i - mean) ** 2 for i in data]  # Calculate squared differences
+    variance = sum(squared_differences) / len(data)  # Find the variance
+    return math.sqrt(variance)  # std = square root of the variance
+
+######################################################
+
+# NOTE:
+# This component can only work for data analysis that have the same amount of corners, corner parcels and corner parcel configurations!
+
+
+# Convert the DataTree to a flat list
+flat_list = []
+
+# Iterate over each branch in the DataTree
+for path in data_package.Paths:
+    branch = data_package.Branch(path)
+    flat_list.extend(branch)  # Add the items in the branch to the flat list
+
+# Set the random seed to ensure reproducible results
+random.seed(random_seed)
+
+# Weighting factor (0 ≤ w ≤ 1), where w determines how much weight is given to the mean
+w = random.uniform(0.1, 0.5)  # Can change this value to adjust the weight
+
+# Number of items per list
+number_of_items = 30    # Can change this in case data_package_analysis has different item count
+
+# Split the flat list into chunks of 23 items each
+data_lists = [flat_list[i:i + number_of_items] for i in range(0, len(flat_list), number_of_items)]
+
+# Initialize merged data package analysis list
+merged_data_package = []
+
+
+
+### CREATE MERGED DATA PACKAGE ANALYSIS ###
+
+# Get scalar (the first boundary polygon area is the reference)
+scalar_area = []
+scalar = []
+for i in range(len(data_lists)):
+    area_to_scale = data_lists[i][24]
+    area_reference = data_lists[0][24]
+    ratio = data_lists[0][24]/data_lists[i][24]
+    scalar_area.append(ratio)
+    one_dim_ratio = round(math.sqrt(ratio),2)
+    scalar.append(one_dim_ratio)
+
+
+# Index 0: Corner parcel type (must be the same for every data package)
+corner_parcel_config = []
+for i in range(len(data_lists[0][0])):
+    corner_parcel_config.append(data_lists[0][0][i])
+merged_data_package.append(corner_parcel_config)
+
+# Index 1: Corner parcel count
+cp_count_store = []
+for i in range(len(data_lists)):
+    cp_count_store.append(data_lists[i][1])
+counter = Counter(cp_count_store)
+most_common_cp_count, frequency = counter.most_common(1)[0]
+merged_data_package.append(most_common_cp_count)
+
+
+# Index 2: Corner parcel mean length
+cp_mean_lengths_store = []
+for i in range(len(data_lists)):
+    mean_length = scalar[i] * data_lists[i][2]
+    cp_mean_lengths_store.append(mean_length)
+
+mean_length = calculate_mean(cp_mean_lengths_store)
+mean_length = round(mean_length, 2)
+merged_data_package.append(mean_length)
+
+
+# Index 3: Corner parcel minimum length
+# Index 4: Corner parcel maximum length
+cp_minimum_lengths_store = []
+cp_maximum_lengths_store = []
+for i in range(len(data_lists)):
+    cp_minimum_length = scalar[i] * data_lists[i][3]
+    cp_minimum_lengths_store.append(cp_minimum_length)
+    cp_maximum_length = scalar[i] * data_lists[i][4]
+    cp_maximum_lengths_store.append(cp_maximum_length)
+# For minimum values
+mean_min = sum(cp_minimum_lengths_store) / len(cp_minimum_lengths_store)  
+lower_bound_min = min(cp_minimum_lengths_store)
+weighted_min = round((w * mean_min) + ((1 - w) * lower_bound_min),2)
+merged_data_package.append(weighted_min)
+# For maximum values
+mean_max = sum(cp_maximum_lengths_store) / len(cp_maximum_lengths_store)  # Mean of the maximum values
+upper_bound_max = max(cp_maximum_lengths_store)  # Largest (upper bound) of the maximum values
+weighted_max = round((w * mean_max) + ((1 - w) * upper_bound_max),2)
+merged_data_package.append(weighted_max)
+
+# Index 5: Corner parcel areas (arbitraray)
+cp_areas = []
+for i in range(len(data_lists[0][5])):
+    cp_areas.append(data_lists[0][5][i])
+merged_data_package.append(cp_areas)
+
+# Index 6: Generic parcel count
+gp_count_store = []
+for i in range(len(data_lists)):
+    gp_count_store.append(data_lists[i][6])
+generic_parcels_count = int(sum(gp_count_store) / len(gp_count_store))
+merged_data_package.append(generic_parcels_count)
+
+# Index 7: Generic parcel mean length
+gp_mean_lengths_store = []
+for i in range(len(data_lists)):
+    gp_mean_length = scalar[i] * data_lists[i][7]
+    gp_mean_lengths_store.append(round(gp_mean_length,2))
+merged_data_package.append(gp_mean_lengths_store)
+
+# Index 8: Generic parcel minimum length
+# Index 9: Generic parcel maximum length
+gp_minimum_lengths_store = []
+gp_maximum_lengths_store = []
+for i in range(len(data_lists)):
+    gp_minimum_lengths_store.append(round(scalar[i] * data_lists[i][8][0]))
+    gp_maximum_lengths_store.append(round(scalar[i] * data_lists[i][9]))
+# For minimum values
+merged_data_package.append(gp_minimum_lengths_store)
+# For maximum values
+merged_data_package.append(gp_maximum_lengths_store)
+
+# Index 10: Generic parcel lengths standard deviation
+# Use a weighed pooled standard deviation
+std_devs_lengths = []
+for i in range(len(data_lists)):
+    std_devs_lengths.append(data_lists[i][10])
+merged_data_package.append(std_devs_lengths)
+
+# Index 11: Generic parcel mean width
+gp_mean_widths_store = []
+for i in range(len(data_lists)):
+    gp_mean_widths_store.append(scalar[i] * data_lists[i][11])
+merged_data_package.append(round(sum(gp_mean_widths_store)/len(gp_mean_widths_store), 2))
+
+
+# Index 12: Generic parcel minimum width
+# Index 13: Generic parcel maximum width
+gp_minimum_widths_store = []
+gp_maximum_widths_store = []
+for i in range(len(data_lists)):
+    gp_minimum_widths_store.append(scalar[i] * data_lists[i][12])
+    gp_maximum_widths_store.append(scalar[i] * data_lists[i][13])
+# For minimum values
+mean_min = sum(gp_minimum_widths_store) / len(gp_minimum_widths_store)  
+lower_bound_min = min(gp_minimum_widths_store)
+weighted_min = round((w * mean_min) + ((1 - w) * lower_bound_min),2)
+merged_data_package.append(weighted_min)
+# For maximum values
+mean_max = sum(gp_maximum_widths_store) / len(gp_maximum_widths_store)  # Mean of the maximum values
+upper_bound_max = max(gp_maximum_widths_store)  # Largest (upper bound) of the maximum values
+weighted_max = round((w * mean_max) + ((1 - w) * upper_bound_max),2)
+merged_data_package.append(weighted_max)
+
+
+# Index 14: Generic parcel widths standard deviation
+# Use a weighed pooled standard deviation
+std_devs_widhts = []
+sample_sizes = []
+for i in range(len(data_lists)):
+    std_devs_widhts.append(data_lists[i][14])
+    sample_sizes.append(data_lists[i][6])
+weighted_variance_sum = sum([(n - 1) * (sd**2) for sd, n in zip(std_devs_widhts, sample_sizes)])
+total_degrees_of_freedom = sum([n - 1 for n in sample_sizes])
+pooled_std_dev = math.sqrt(weighted_variance_sum / total_degrees_of_freedom)
+merged_data_package.append(round(pooled_std_dev, 2))
+
+# Index 15: Generic parcel count per boundary edge
+gp_count_per_be_stored = []
+for i in range(len(data_lists)):
+    python_list = list(data_lists[i][15])
+    python_list.sort()
+    gp_count_per_be_stored.append(python_list)
+gp_count_means = []
+for i in range(len(data_lists[0][15])):
+    individual_count_store = []
+    for j in range(len(gp_count_per_be_stored)):
+        individual_count_store.append(gp_count_per_be_stored[j][i])
+    gp_count_means.append(round(sum(individual_count_store)/len(individual_count_store), 0))
+generic_parcels_per_boundary_edge = proportional_split(generic_parcels_count, gp_count_means)
+
+merged_data_package.append(generic_parcels_per_boundary_edge)
+
+
+# Index 16: Generic parcel indentations per boundary edge:
+indentation_counts_stored = []
+for i in range(len(data_lists)):
+    for j in range(len(data_lists[i][16])):
+        indentation_counts_stored.append(data_lists[i][16][j])
+gp_indentation_counts_per_be = []
+for i in range(len(data_lists[0][16])):
+    gp_indentation_counts_per_be.append(random.choice(indentation_counts_stored))
+
+merged_data_package.append(gp_indentation_counts_per_be)
+
+
+# Index 17: Generic parcel dimension pairs (irrelevant)
+stored = []
+dim_pairs = []
+for i in range(len(data_lists)):
+    for j in range(len(data_lists[i][17])):
+        length = round(scalar[i] * data_lists[i][17][j][0],2)
+        width = round(scalar[i] * data_lists[i][17][j][1],2)
+        stored.append([length, width])
+for i in range(generic_parcels_count):
+    chosen_pair = random.choice(stored)
+    dim_pairs.append(chosen_pair)
+merged_data_package.append(dim_pairs)
+
+# Index 18: Generic parcel areas
+areas = []
+for i in range(len(dim_pairs)):
+    length = dim_pairs[i][0]
+    width = dim_pairs[i][1]
+    area = round(length * width, 2)
+    areas.append(area)
+merged_data_package.append(areas)
+
+# Index 19: Generic parcel to building footprint area ratio (irrelevant)
+var = data_lists[0][19]
+merged_data_package.append(var)
+
+# Index 20: corner parcel dimension pairs
+cp_dims = []
+for i in range(len(data_lists)):
+    for j in range(len(data_lists[i][20])):
+        scaled_dims = [round(x * scalar[i],2) for x in data_lists[i][20][j]]
+        cp_dims.append(scaled_dims)
+merged_data_package.append(cp_dims)
+
+
+# Index 21: Average length after which an indentation occurs:
+ind_lengths = []
+for i in range(len(data_lists)):
+    ind_length = data_lists[i][21][0]
+    ind_lengths.append(round(ind_length,2))
+merged_data_package.append(ind_lengths)
+
+# Index 22: Length threshold, under which two corners create pentalateral
+penta_lengths = []
+for i in range(len(data_lists)):
+    penta_length = data_lists[i][22]
+    penta_lengths.append(penta_length)
+merged_data_package.append(max(penta_lengths))
+
+
+# Index 23: Corner parcel edges angles:
+cp_edge_angles_pairs = []
+for i in range(len(data_lists)):
+    for j in range(len(data_lists[i][23])):
+        corner_1 = data_lists[i][23][j][0]
+        corner_2 = data_lists[i][23][j][0]
+        cp_edge_angles_pairs.append([corner_1, corner_2])
+cp_angles_choice = []
+for i in range(most_common_cp_count):
+    cp_angles_choice.append(random.choice(cp_edge_angles_pairs))
+merged_data_package.append(cp_angles_choice)
+
+# Index 24: Boundary area to scale towards
+merged_data_package.append(data_lists[0][24])
+
+# Index 25: Building mean height
+building_heights_store = []
+for i in range(len(data_lists)):
+    building_mean_heigths = data_lists[i][25]
+    building_heights_store.append(building_mean_heigths)
+building_mean_heigth = calculate_mean(building_heights_store)
+building_mean_heigth = round(building_mean_heigth, 2)
+merged_data_package.append(building_mean_heigth)
+
+# Index 26: Building minimum heigth
+# Index 27: Building maximum heigth
+b_minimum_heights_store = []
+b_maximum_heights_store = []
+for i in range(len(data_lists)):
+    b_minimum_heights_store.append(data_lists[i][26])
+    b_maximum_heights_store.append(data_lists[i][27])
+# For minimum values
+mean_min = sum(b_minimum_heights_store ) / len(b_minimum_heights_store )  
+lower_bound_min = min(b_minimum_heights_store)
+weighted_min = round((w * mean_min) + ((1 - w) * lower_bound_min),2)
+merged_data_package.append(weighted_min)
+# For maximum values
+mean_max = sum(b_maximum_heights_store) / len(b_maximum_heights_store)  # Mean of the maximum values
+upper_bound_max = max(b_maximum_heights_store)  # Largest (upper bound) of the maximum values
+weighted_max = round((w * mean_max) + ((1 - w) * upper_bound_max),2)
+merged_data_package.append(weighted_max)
+
+# Index 28: Building heights standard deviation
+# Use a weighed pooled standard deviation
+std_devs_b_heights = []
+sample_sizes = []
+for i in range(len(data_lists)):
+    std_devs_b_heights.append(data_lists[i][28])
+    sample_sizes.append(data_lists[i][29])
+weighted_variance_sum = sum([(n - 1) * (sd**2) for sd, n in zip(std_devs_b_heights, sample_sizes)])
+total_degrees_of_freedom = sum([n - 1 for n in sample_sizes])
+pooled_std_dev = math.sqrt(weighted_variance_sum / total_degrees_of_freedom)
+merged_data_package.append(round(pooled_std_dev, 2))
+
+merged_data_text = [
+    f"Corner parcel configurations: {merged_data_package[0]}",
+    f"Corner parcel count: {merged_data_package[1]}",
+    f"Corner parcel mean length: {merged_data_package[2]}",
+    f"Corner parcel minimum length: {merged_data_package[3]}",
+    f"Corner parcel maximum length: {merged_data_package[4]}",
+    f"Corner parcel areas: {merged_data_package[5]}",
+    f"Generic parcel total count: {merged_data_package[6]}",
+    f"Generic parcel mean length: {merged_data_package[7]}",
+    f"Generic parcel minimum length: {merged_data_package[8]}",
+    f"Generic parcel maximum length: {merged_data_package[9]}",
+    f"Generic parcel lengths standard deviation: {merged_data_package[10]}",
+    f"Generic parcel mean widths: {merged_data_package[11]}",
+    f"Generic parcel minimum widths: {merged_data_package[12]}",
+    f"Generic parcel maximum widths: {merged_data_package[13]}",
+    f"Generic parcel widths standard deviation: {merged_data_package[14]}",
+    f"Generic parcel count per boundary edge: {merged_data_package[15]}",
+    f"Generic parcel indentations per boundary edge: {merged_data_package[16]}",    
+    f"Generic parcel dimension pairs (length = index 0, width = index 1): {merged_data_package[17]}",
+    f"Generic parcel areas: {merged_data_package[18]}",
+    f"Generic parcel to building footprint area ratio: {merged_data_package[19]}",
+    f"Corner parcel dimension pairs: {merged_data_package[20]}",
+    f"Average length after which an indentation occurs: {merged_data_package[21]}",
+    f"Length threshold, under which two corners create pentalateral: {merged_data_package[22]}",
+    f"Corner parcel edges angles: {merged_data_package[23]}",
+    f"Boundary Polygon Area: {merged_data_package[24]}",
+    f"Building mean height: {merged_data_package[25]}",
+    f"Building minimum height: {merged_data_package[26]}",
+    f"Building maximum heigth: {merged_data_package[27]}",
+    f"Building height standard deviation: {merged_data_package[28]}"
+]
