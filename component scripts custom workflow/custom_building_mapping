@@ -1,0 +1,397 @@
+# Custom Building Mapping component
+# This component does not require the output from the Block Analysis component
+# Rather, buildings and parcels can be directly used as input (without cohesion through a shared boundary)
+
+# Required inputs:
+# 1. corner_parcels (closed polyline curve GUIDs)
+# 2. corner_buildings (" ")
+# 3. generic_parcels (" ")
+# 4. generic_buildings (" ")
+
+
+import Rhino
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import math
+
+#####################################################################################
+
+""" FUNCTIONS """
+
+# Function to ensure the vertices of the parcel are ordered counter-clockwise.
+def ensure_counterclockwise(parcel):
+    polyline = parcel.ToPolyline()
+    vertices = polyline.ToArray()  # Get vertices as an array
+    signed_area_sum = 0
+    # Shoelace theorem to check clockwise or counter-clockwise
+    for i in range(len(vertices)):
+        v1 = vertices[i]
+        v2 = vertices[(i + 1) % len(vertices)]  # Next vertex (with wrap-around)
+        signed_area_sum += (v2.X - v1.X) * (v2.Y + v1.Y)
+    # If total is positive, the vertices are ordered clockwise
+    if signed_area_sum > 0:
+        vertices = list(reversed(vertices))  # Reverse the vertices if clockwise
+        return rg.PolylineCurve(vertices)  # Return the polyline with counter-clockwise vertices
+    else:
+        return parcel  # Already counter-clockwise, return the original parcel
+
+# Function to reorder vertices such that the first vertex is closest to corner and ensure counterclockwise order.
+def reorder_vertices_to_start_at_corner(vertices, corner, tolerance=1e-6):  
+    # Find the index of the vertex closest to the corner
+    min_distance = float("inf")
+    vertex_0_index = 0
+    for i in range(len(vertices)):
+        distance = vertices[i].DistanceTo(corner)
+        if distance < min_distance:
+            min_distance = distance
+            vertex_0_index = i
+    # Reorder the vertices starting from the closest point
+    reordered_vertices = [vertices[(i + vertex_0_index) % len(vertices)] for i in range(len(vertices))]
+    # Remove consecutive duplicate vertices (within a small tolerance)
+    unique_reordered_vertices = [reordered_vertices[0]]
+    for i in range(1, len(vertices)):
+        if reordered_vertices[i].DistanceTo(unique_reordered_vertices[-1]) > tolerance:
+            unique_reordered_vertices.append(reordered_vertices[i])
+    # Ensure the last vertex is not a duplicate of the first vertex
+    if unique_reordered_vertices[0].DistanceTo(unique_reordered_vertices[-1]) < tolerance:
+        unique_reordered_vertices.pop()
+    # Check if the reordered vertices are counterclockwise using the Shoelace theorem
+    signed_area_sum = 0
+    for i in range(len(unique_reordered_vertices)):
+        v1 = unique_reordered_vertices[i]
+        v2 = unique_reordered_vertices[(i + 1) % len(unique_reordered_vertices)]  # Next vertex (with wrap-around)
+        signed_area_sum += (v2.X - v1.X) * (v2.Y + v1.Y)
+    if signed_area_sum > 0:
+        unique_reordered_vertices.reverse()
+    else:
+        unique_reordered_vertices = unique_reordered_vertices
+    return unique_reordered_vertices
+
+# Function to generate a grid inside a quadrilateral parcel. Uses a bilinear interpolation between the edges of the quadrilateral.
+def generate_grid_in_quadrilateral_parcel(parcel_vertices, grid_resolution):
+    grid_points = []
+    if len(parcel_vertices) == 5:
+        parcel_vertices.pop()
+    # Get the four corners of the quadrilateral
+    v0, v1, v2, v3 = parcel_vertices
+    for u in range(grid_resolution + 1):
+        u_ratio = u / grid_resolution  # The relative position along the U direction (horizontal)
+        # Interpolate between v0->v3 (left) and v1->v2 (right) edges
+        left_interp = v0 + (v3 - v0) * u_ratio
+        right_interp = v1 + (v2 - v1) * u_ratio
+        for v in range(grid_resolution + 1):
+            v_ratio = v / grid_resolution  # The relative position along the V direction (vertical)
+            # Interpolate between the left and right edges at the current u_ratio
+            grid_point = left_interp + (right_interp - left_interp) * v_ratio
+            grid_points.append(grid_point)
+    return grid_points
+
+# Function to map the building vertices to the indices of the grid points of the quadrilateral parcel.
+def compute_building_indeces_quadrilateral(building_vertices, grid_in):
+    building_indices = []
+    for building_vertex in building_vertices:
+        # Find the closest point in the input grid and get its index
+        closest_index_in = min(range(len(grid_in)), key=lambda i: building_vertex.DistanceTo(grid_in[i]))
+        building_indices.append(closest_index_in)
+    # Returns a list of indices that represent the mapping.
+    return building_indices
+
+# Function to find a center point that is roughly equidistant from all vertices by fitting a circle.
+def compute_weighted_center(vertices):
+    # Compute the bounding box and the center of the bounding box
+    bounding_box = rg.BoundingBox(vertices)
+    center_point = bounding_box.Center
+    # Find the average distance of the vertices to the center point
+    average_distance = sum([center_point.DistanceTo(vertex) for vertex in vertices]) / len(vertices)
+    # Create a sphere at the center with radius equal to the average distance to the vertices
+    sphere = rg.Sphere(center_point, average_distance)
+    # Return the center of the sphere (rough center of the pentalateral)
+    return sphere.Center
+
+# Function to subdivide a triangle into four smaller triangles by adding midpoints on its edges.
+def subdivide_triangle(v0, v1, v2):
+    # Compute midpoints
+    mid_v0_v1 = v0 + (v1 - v0) * 0.5
+    mid_v1_v2 = v1 + (v2 - v1) * 0.5
+    mid_v2_v0 = v2 + (v0 - v2) * 0.5
+    # Create smaller triangles
+    triangles = [
+        (v0, mid_v0_v1, mid_v2_v0),
+        (mid_v0_v1, v1, mid_v1_v2),
+        (mid_v2_v0, mid_v1_v2, v2),
+        (mid_v0_v1, mid_v1_v2, mid_v2_v0)
+    ]
+    # Return triangles and midpoints as potential intersection points
+    return triangles, [mid_v0_v1, mid_v1_v2, mid_v2_v0]
+
+# Function to subdivide triangles of a pentalateral iteratively with consistent indexing
+def subdivide_pentagon_triangles_with_indexing(vertices, center):
+    # Create initial triangles (center to adjacent vertices)
+    triangles = []
+    indexed_points = []  # Track points in a consistent order
+    indexed_points.append(center)  # Start with the centroid having index 0
+    iterations = 3
+    # Add the original vertices with consistent indexing
+    indexed_points.extend(vertices)  # Add pentagon vertices (these will get indices 1-5)
+    for i in range(len(vertices)):
+        v0 = vertices[i]
+        v1 = vertices[(i + 1) % len(vertices)]
+        triangles.append((center, v0, v1))
+    # Subdivide the triangles iteratively
+    for _ in range(iterations):
+        new_triangles = []
+        for tri in triangles:
+            # Subdivide the triangle and get the new midpoints
+            subdivided, midpoints = subdivide_triangle(*tri)
+            # Check each midpoint and assign it an index if it's new
+            for midpoint in midpoints:
+                if midpoint not in indexed_points:
+                    indexed_points.append(midpoint)
+            new_triangles.extend(subdivided)
+        triangles = new_triangles
+    return triangles, indexed_points
+
+# Function to map the building vertices to the indices of the sorted points of the grid in the parcel
+def map_building_to_indices(building_vertices, sorted_points_in):
+    building_indices = []
+    for building_vertex in building_vertices:
+        # Find the closest point in the sorted_points_in and get its index
+        closest_index_in = min(range(len(sorted_points_in)), key=lambda i: building_vertex.DistanceTo(sorted_points_in[i]))
+        building_indices.append(closest_index_in)
+    return building_indices
+
+#####################################################################################
+
+
+
+###############
+""" INPUTS """
+
+# Set tolerance for geometric comparison
+tolerance = 1e-5
+
+# Set grid resolution for mapping
+grid_resolution = 25
+
+# Initialize lists for coerced curves
+cp = []
+cp_buildings = []
+gp = []
+gp_buildings = []
+
+# Coerce all cruves to polylines
+for parcel in corner_parcels:
+    cp_parcel = rs.coercecurve(parcel)
+    cp.append(cp_parcel)
+for parcel in generic_parcels:
+    gp_parcel = rs.coercecurve(parcel)
+    gp.append(gp_parcel)
+for building in corner_buildings:
+    cp_building = rs.coercecurve(building)
+    cp_buildings.append(cp_building)
+for building in generic_buildings:
+    gp_building = rs.coercecurve(building)
+    gp_buildings.append(gp_building)
+
+
+# List to store corner parcel configurations
+cp_configurations = []
+
+for parcel in cp:
+    parcel_vertices = parcel.ToPolyline().ToArray()
+    if len(parcel_vertices) == 6:
+        cp_configurations.append("pentalateral")
+    else:
+        cp_configurations.append("quadrilateral")
+
+
+###################################
+""" ASSIGN BUILDINGS TO PARCELS """
+
+# Lists to store buildings in parcels
+gp_to_building_map = [[] for _ in range(len(gp))] 
+cp_to_building_map = [[] for _ in range(len(cp))]  
+
+# Store all generic buildings in the generic parcel to building map
+for building in gp_buildings:
+    building_curve = rs.coercecurve(building)
+    building_points = building_curve.ToPolyline().ToArray()
+
+    # Map buildings to generic parcels
+    for i in range(len(gp)): 
+        inside = True
+        gp_check = rs.coercecurve(gp[i])
+        for pt in building_points:
+            result = gp_check.Contains(pt, rg.Plane.WorldXY, tolerance)
+            if result != rg.PointContainment.Inside and result != rg.PointContainment.Coincident:
+                inside = False  # Set to False if any point is outside
+                break  # If any point is outside, stop checking further
+        if inside:
+            # Append the building to the corresponding parcel in the generic parcel mapping
+            gp_to_building_map[i].append(building_curve)
+
+
+# Store all corner buildings in the corner parcel to building map
+for building in cp_buildings:
+    building_curve = rs.coercecurve(building)
+    building_points = building_curve.ToPolyline().ToArray()
+
+    # Map buildings to corner parcels
+    for i in range(len(cp)): 
+        inside = True
+        cp_check = rs.coercecurve(cp[i])
+        for pt in building_points:
+            result = cp_check.Contains(pt, rg.Plane.WorldXY, tolerance)
+            if result != rg.PointContainment.Inside and result != rg.PointContainment.Coincident:
+                inside = False 
+                break  
+        if inside:
+            # Append the building to the corresponding parcel in the corner parcel mapping
+            cp_to_building_map[i].append(building_curve)
+
+
+
+################################
+""" CORNER BUILDING MAPPING """
+
+# Initialize list for corner building UV mapping (each element will be a nested list: dimensions + buildings)
+corner_buildings_map = []
+
+# Iterate through all corner parcels and create the building map
+for i, buildings in enumerate(cp_to_building_map):
+
+    # Access the corresponding parcel 
+    parcel = corner_parcels[i]  
+    parcel = rs.coercecurve(parcel)
+    parcel = ensure_counterclockwise(parcel)
+    parcel_vertices = list(parcel.ToPolyline().ToArray())
+    parcel_vertices_python_list = list(parcel.ToArray())
+
+    # Initialize a new list to store the dimension pair and building mappings for this parcel
+    parcel_info = []
+
+    # Map buildings in quadrilateral corner parcels
+    if cp_configurations[i] == "quadrilateral":
+
+        # Get dimension pair of quadrilateral corner parcel
+        cp_dim_1 = round(parcel_vertices[0].DistanceTo(parcel_vertices[1]), 2)
+        cp_dim_2 = round(parcel_vertices[1].DistanceTo(parcel_vertices[2]), 2)
+        cp_dimensions = [cp_dim_1, cp_dim_2]  # Dimensions for quadrilateral parcel
+
+        # Add the dimension pair as the first element in the list
+        parcel_info.append(cp_dimensions)
+
+        # Add aspect ratio as the second element in the list
+        aspect_ratio = round(cp_dim_1 / cp_dim_2, 2)
+        parcel_info.append(aspect_ratio)
+
+        # Generate a UV mapping grid for the quadrilateral corner parcel
+        grid_points = generate_grid_in_quadrilateral_parcel(parcel_vertices, grid_resolution)
+
+        # Initialize mapping_info (which serves as anothera nested list in the building map data structure)
+        mapping_info = []
+
+        # Loop through all buildings inside this parcel
+        for building in buildings:
+            building_curve = rs.coercecurve(building)
+            building_vertices = list(building_curve.ToPolyline().ToArray())
+            # Compute the U-V coordinates of the footprint vertices within the grid
+            building_mapping = compute_building_indeces_quadrilateral(building_vertices, grid_points)
+            mapping_info.append(building_mapping)
+
+        # Add the mapping info list to parcel info (ensuring one nested list for all mappings)
+        parcel_info.append(mapping_info)
+
+    # Map buildings in pentalateral corner parcels
+    elif cp_configurations[i] == "pentalateral":
+
+        # Get dimension trio of pentalateral corner parcel
+        cp_dim_1 = round(parcel_vertices[0].DistanceTo(parcel_vertices[1]), 2)
+        cp_dim_2 = round(parcel_vertices[1].DistanceTo(parcel_vertices[2]), 2)
+        cp_dim_3 = round(parcel_vertices[0].DistanceTo(parcel_vertices[4]), 2)
+        cp_dimensions = [cp_dim_1, cp_dim_2, cp_dim_3]  # Dimensions for pentalateral parcel
+
+        # Add the dimension trio as the first element in the list
+        parcel_info.append(cp_dimensions)
+
+        # Add aspect ratio as the second element in the list
+        aspect_ratio = round(cp_dim_1 / cp_dim_2, 2)
+        parcel_info.append(aspect_ratio)
+
+        # Compute the weighted center as centroid of a constrained circumcircle within the pentalateral parcel
+        centroid = compute_weighted_center(parcel_vertices)
+
+        # Subdivide the pentalateral triangles iteratively
+        triangles, indexed_points = subdivide_pentagon_triangles_with_indexing(parcel_vertices_python_list, centroid)
+
+        # Initialize mapping_info (which serves as anothera nested list in the building map data structure)
+        mapping_info = []
+
+        # Loop through all buildings inside this parcel
+        for building in buildings:
+            building_curve = rs.coercecurve(building)
+            building_polyline = building_curve.ToPolyline()
+            building_vertices = list(building_polyline.ToArray())
+
+            # Map the building vertices to their corresponding indices in the in-parcel
+            building_mapping = map_building_to_indices(building_vertices, indexed_points)
+            mapping_info.append(building_mapping)  # Add the building mapping
+            
+        # Add the mapping info list to parcel info (ensuring one nested list for all mappings)
+        parcel_info.append(mapping_info)
+        
+    # Add the list of parcel_info (dimension + building mappings) to the main list
+    corner_buildings_map.append(parcel_info)
+
+
+################################
+""" GENERIC BUILDING MAPPING """
+
+# Initialize list for corner building UV mapping (each element will be a nested list: dimensions + buildings)
+generic_buildings_map = []
+
+# Iterate through all corner parcels and create the building map
+for i, buildings in enumerate(gp_to_building_map):
+
+    # Access the corresponding parcel 
+    parcel = generic_parcels[i]  
+    parcel = rs.coercecurve(parcel)
+    parcel = ensure_counterclockwise(parcel)
+    parcel_vertices = list(parcel.ToPolyline().ToArray())
+    parcel_vertices_python_list = list(parcel.ToArray())
+
+    # Initialize a new list to store the dimension pair and building mappings for this parcel
+    parcel_info = []
+
+    # Get dimension pair of quadrilateral corner parcel
+    cp_dim_1 = round(parcel_vertices[0].DistanceTo(parcel_vertices[1]), 2)
+    cp_dim_2 = round(parcel_vertices[1].DistanceTo(parcel_vertices[2]), 2)
+    cp_dimensions = [cp_dim_1, cp_dim_2]  # Dimensions for quadrilateral parcel
+
+    # Add the dimension pair as the first element in the list
+    parcel_info.append(cp_dimensions)
+
+    # Add aspect ratio as the second element in the list
+    aspect_ratio = round(cp_dim_1 / cp_dim_2, 2)
+    parcel_info.append(aspect_ratio)
+
+    # Generate a UV mapping grid for the quadrilateral corner parcel
+    grid_points = generate_grid_in_quadrilateral_parcel(parcel_vertices, grid_resolution)
+
+    # Initialize mapping_info (which serves as anothera nested list in the building map data structure)
+    mapping_info = []
+
+    # Loop through all buildings inside this parcel
+    for building in buildings:
+        building_curve = rs.coercecurve(building)
+        building_vertices = list(building_curve.ToPolyline().ToArray())
+
+        # Compute the U-V coordinates of the footprint vertices within the grid
+        building_mapping = compute_building_indeces_quadrilateral(building_vertices, grid_points)
+        mapping_info.append(building_mapping)
+
+        # Add the mapping info list to parcel info (ensuring one nested list for all mappings)
+        parcel_info.append(mapping_info)
+
+    # Add the list of parcel_info (dimension + building mappings) to the main list
+    generic_buildings_map.append(parcel_info)
