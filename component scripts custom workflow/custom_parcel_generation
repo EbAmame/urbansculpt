@@ -1,0 +1,862 @@
+# Custom Parcel Generation Component
+
+# Required inputs:
+# 1. boundaries (closed polyline curve GUIDs)
+# 2. cp_min_width (float or int)
+# 3. cp_max_width (float or int)
+# 4. cp_min_angle (in degrees, float or int)
+# 5. cp_max_angle (" ")
+# 6. gp_mean_length (float or int)
+# 7. gp_min_length (" ")
+# 8. gp_max_length (" ")
+# 9. gp_length_std (" ")
+# 10. gp_mean_width (" ")
+# 11. gp_min_width (" ")
+# 12. gp_max_width (" ")
+# 13. gp_width_std (" ")
+# 14. ind_ref_length (" ")
+# 15. penta_threshold (" ")
+# 16. random_seed (int)
+
+
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import random
+import math
+
+#####################################################################################
+
+""" FUNCTIONS"""
+
+# Function to rotate two lists together
+def rotate_list(lst):
+    # Get a random index as the new starting point
+    random_index = random.randint(0, len(lst) - 1)
+    # Rotate the list using slicing
+    rotated_list = lst[random_index:] + lst[:random_index]
+    return rotated_list
+
+# Function to find the closest first value in each nested list compared to a reference
+def find_closest_values(nested_list, reference):
+    closest_value = None
+    closest_list = None
+    min_difference = float('inf')  # Start with a very large value for comparison
+    # Iterate over the nested lists
+    for sublist in nested_list:
+        first_value = sublist[0]  # Get the first value of the current nested list
+        difference = abs(first_value - reference)  # Calculate the difference
+        # Check if this is the smallest difference so far
+        if difference < min_difference:
+            min_difference = difference
+            closest_value = first_value
+            closest_list = sublist
+    if closest_list:
+        return closest_list[1:]  # Get the other two values from the closest list
+    else:
+        return None
+
+# Function to calculate signed area to determine polygon orientation
+def signed_area(vertices):
+    area = 0.0
+    n = len(vertices)
+    for i in range(n):
+        x1, y1, _ = vertices[i]
+        x2, y2, _ = vertices[(i + 1) % n]
+        area += (x1 * y2 - x2 * y1)
+    return area / 2.0
+
+# Function to create unitized vectors refering to the (counter-clockwise) direction of each edge
+def compute_vector(edge):
+    edge_vector = rs.VectorUnitize(rs.VectorCreate(edge[1], edge[0]))
+    return edge_vector
+
+# Function to reverse any vector
+def rev_vector(vector):
+    reversed_vector = rs.VectorScale(vector, -1)
+    return reversed_vector
+
+# Function to get input angle vector
+def angle_vec(start_point, end_point, angle):
+    direction_vector = rg.Vector3d(end_point.X - start_point.X, end_point.Y - start_point.Y, 0)
+    arg = math.radians(angle)
+    rotated_x = direction_vector.X * math.cos(arg) - direction_vector.Y * math.sin(arg)
+    rotated_y = direction_vector.X * math.sin(arg) + direction_vector.Y * math.cos(arg)
+    angle_vector = rg.Vector3d(rotated_x, rotated_y, 0)
+    angle_vector.Unitize()
+    return angle_vector
+
+# Function to interpolate between two vectors
+def interpolate_vectors(vec1, vec2, t):
+    interpolated_vec = rg.Vector3d(
+        (1 - t) * vec1.X + t * vec2.X,
+        (1 - t) * vec1.Y + t * vec2.Y,
+        (1 - t) * vec1.Z + t * vec2.Z
+    )
+    interpolated_vec.Unitize()
+    return interpolated_vec
+
+# Function to receive intersection point of two vectors
+def find_intersection(start_pt_1, vec_1, start_pt_2, vec_2):
+    # Solve for t and s such that start_pt_1 + t*vec_1 = start_pt_2 + s*vec_2
+    denom = vec_1.X * vec_2.Y - vec_1.Y * vec_2.X
+    if denom == 0:
+        return None  # Parallel lines, no intersection
+    t = ((start_pt_2.X - start_pt_1.X) * vec_2.Y - (start_pt_2.Y - start_pt_1.Y) * vec_2.X) / denom
+    s = ((start_pt_2.X - start_pt_1.X) * vec_1.Y - (start_pt_2.Y - start_pt_1.Y) * vec_1.X) / denom
+    intersection = rg.Point3d(start_pt_1.X + t * vec_1.X, start_pt_1.Y + t * vec_1.Y, 0)
+    return intersection
+
+# Function to check polyline intersection
+def check_polyline_intersection(polyline1, polyline2):
+    curve1 = polyline1.ToNurbsCurve()  # Convert the polylines to curve objects
+    curve2 = polyline2.ToNurbsCurve()
+    intersection_events = rg.Intersect.Intersection.CurveCurve(curve1, curve2, 0.001, 0.0) # Check for curve-curve intersection
+    if intersection_events.Count > 0:
+        return True # If any intersections are found, return True
+    else:
+        return False # Otherwise, return False
+
+def calculate_if_angle_between_edges_is_smaller_than_110(unit_vec_1, unit_vec_2): 
+    dot_product = rg.Vector3d.Multiply(unit_vec_1, unit_vec_2)  # Compute the dot product
+    dot_product = max(min(dot_product, 1.0), -1.0)  # Clamp the value to avoid numerical issues
+    # Compute the angle in radians
+    angle_radians = math.acos(dot_product)
+    # Convert the angle to degrees
+    angle_degrees = math.degrees(angle_radians)
+    if angle_degrees < 110:
+        return True  # Angle is smaller than 110°
+    else:
+        return False  # Angle is 110° or larger
+
+def calculate_angle_between_edges(unit_vec_1, unit_vec_2): 
+    dot_product = rg.Vector3d.Multiply(unit_vec_1, unit_vec_2)  # Compute the dot product
+    dot_product = max(min(dot_product, 1.0), -1.0)  # Clamp the value to avoid numerical issues
+    # Compute the angle in radians
+    angle_radians = math.acos(dot_product)
+    # Convert the angle to degrees
+    angle_degrees = math.degrees(angle_radians)
+    return angle_degrees 
+
+# Function to  clamp value to stay within the given range [min_val, max_val].
+def clamp(value, min_val, max_val):
+    return max(min(value, max_val), min_val)
+
+# Function to Apply a slight deviation to values in the local domain while ensuring they stay within the global domain.
+def apply_deviation_within_domain(global_domain, local_domain, deviation_percentage=0.1):
+    # Unpack global and local domains
+    min_global, max_global = global_domain
+    min_local, max_local = local_domain
+    # Calculate the allowable deviation as a percentage of the local domain range
+    deviation_range = (max_local - min_local) * deviation_percentage
+    # Apply random deviation to the local domain values
+    new_min = min_local + random.uniform(-deviation_range, deviation_range)
+    new_max = max_local + random.uniform(-deviation_range, deviation_range)
+    # Ensure the new values stay within the global domain by clamping
+    new_min = clamp(new_min, min_global, max_global)
+    new_max = clamp(new_max, min_global, max_global)
+    return new_min, new_max
+
+# Function to find corresponding dimensions
+def find_matching_lengths(pairs, width):
+    # Define tolerance (10% of difference max and min)
+    widths = [pair[1] for pair in pairs]
+    max_width = max(widths)
+    min_width = min(widths)
+    tolerance = 0.1*(max_width - min_width)
+    # Define the domain around the random width (± tolerance)
+    lower_bound = width - tolerance
+    upper_bound = width + tolerance
+    # Filter the pairs where the length is within the domain
+    matching_pairs = [pair for pair in pairs if lower_bound <= pair[1] <= upper_bound]
+    # If there are no matching pairs, random choice
+    if not matching_pairs:
+        selected_pair = random.choice(pairs)
+        return selected_pair[0]
+    else:
+        # Randomly select one of the matching pairs and return the corresponding width
+        selected_pair = random.choice(matching_pairs)
+        # Return the matching lenght
+        return selected_pair[0]
+
+# Function to calculate the angle between 2 lines
+def calculate_angle_between_lines(point_start, point_end1, point_end2):
+    # Define the vectors based on the starting point and endpoints
+    vector1 = [point_end1[0] - point_start[0], point_end1[1] - point_start[1]]
+    vector2 = [point_end2[0] - point_start[0], point_end2[1] - point_start[1]]
+    # Calculate the dot product of the two vectors
+    dot_product = vector1[0] * vector2[0] + vector1[1] * vector2[1]
+    # Calculate the magnitudes (lengths) of the two vectors
+    magnitude1 = math.sqrt(vector1[0]**2 + vector1[1]**2)
+    magnitude2 = math.sqrt(vector2[0]**2 + vector2[1]**2)
+    # Calculate the cosine of the angle
+    cos_theta = dot_product / (magnitude1 * magnitude2)
+    # Calculate the angle in radians
+    angle_radians = math.acos(cos_theta)
+    # Convert the angle to degrees (optional)
+    angle_degrees = math.degrees(angle_radians)
+    return angle_degrees
+
+#####################################################################################
+
+# SHORTCUTS FOR LEGIBILITY:
+# generic_parcels: "gp"
+# corner_parcels: "gp"
+
+###################################
+""" INPUTS, LISTS AND CONSTANTS """
+
+# Boundary curves are the input
+boundary_curves = boundaries
+
+# Set tolerance for geometric comparison
+tolerance = 1e-5
+
+# Set the random seed to ensure reproducible results
+random.seed(random_seed)
+
+# Initialize output
+all_parcels = []
+all_parcels_building_generation = []
+
+# Reference boundary curve
+ref_boundary_curve = boundary_curves[0]
+ref_area = rs.CurveArea(ref_boundary_curve)[0]
+
+
+##########################
+""" SETTING THE SCENE """
+
+for boundary_curve in boundary_curves:
+
+    # Boundary curve input
+    boundary_curve = rs.coercecurve(boundary_curve)  
+    boundary_area = rs.CurveArea(boundary_curve)[0]
+    boundary_area = round(boundary_area,2)
+    boundary_vertices = boundary_curve.ToPolyline().ToArray()
+
+    # Get scalar
+    scalar_area = boundary_area / ref_area
+    scalar =  round(math.sqrt(scalar_area),2)
+
+    # Custom Inputs
+    corner_parcel_type = "quadrilateral"
+    corner_dim = rg.Interval(scalar * cp_min_width, scalar * cp_max_width)
+    cp_angle_mean = (cp_min_angle + cp_max_angle)/2
+    cp_angles = []
+    for i in range(len(boundary_vertices)-1):
+        lb_angle = random.uniform(cp_min_angle, cp_angle_mean)
+        ub_angle = random.uniform(cp_angle_mean, cp_max_angle)
+        cp_angles.append([lb_angle, ub_angle])
+    gp_lengths_mean = scalar * gp_mean_length
+    gp_length_lb = scalar * gp_min_length
+    gp_length_ub = scalar * gp_max_length
+    gp_lengths_domain = rg.Interval(gp_length_lb, gp_length_ub)
+    gp_lengths_sd = gp_length_std
+    gp_widths_mean = scalar * gp_mean_width
+    gp_width_lb = scalar * gp_min_width
+    gp_width_ub = scalar * gp_max_width
+    gp_widths_domain = rg.Interval(gp_width_lb, gp_width_ub)
+    gp_widths_sd = gp_width_std
+    indentation_reference_length = ind_ref_length * scalar
+    gp_dim_pairs = []
+    cp_dim_pairs = []
+    for i in range(len(boundary_vertices)-1):
+        gp_dim_1 = random.uniform(gp_lengths_domain[0], gp_lengths_domain[1])
+        gp_dim_2 = random.uniform(gp_widths_domain[0], gp_widths_domain[1])
+        gp_dim_pairs.append([gp_dim_1, gp_dim_2])
+        cp_dim_1 = random.uniform(corner_dim[0], corner_dim[1])
+        cp_dim_2 = random.uniform(corner_dim[0], corner_dim[1])
+        cp_dim_3 = random.uniform(corner_dim[0], corner_dim[1])
+        cp_dim_pairs.append([cp_dim_1, cp_dim_2])
+        cp_dim_pairs.append([cp_dim_1, cp_dim_2, cp_dim_3])
+    penta_threshold = penta_threshold
+
+    
+
+    # Initialize lists to store data and geometry
+    generic_parcels = []
+    corner_parcels = []
+    cp_vertices = []
+    cp_config = []
+
+
+    ###################################
+    """ BOUNDARY POLYGON DISSECTION """
+
+    # Get the boundary polygon edges and vertices
+    boundary_pts = rs.PolylineVertices(boundary_curve)
+    if len(boundary_pts) < 4:
+        raise ValueError("Invalid Boundary, must have at least three vertices")
+    if boundary_pts[0] != boundary_pts[len(boundary_pts)-1]:
+        raise ValueError("Boundary Polygon must be a closed Polyline Curve")
+
+    # Ensure counter-clockwise order for consistent polyline construction
+    if signed_area(boundary_pts) < 0:
+        boundary_pts.reverse()  # Reverse the order to make it counter-clockwise
+
+    # Create a list of edges (based on boundary point index)
+    edges = [(boundary_pts[i], boundary_pts[(i + 1) % len(boundary_pts)]) for i in range(len(boundary_pts) - 1)]
+
+    # Create unit vectors, to ensure accurate geometric operations according to the boundary edge vectors.
+    unit_vecs = []
+    for i in range(len(boundary_pts)-1):
+        unit_vecs.append(compute_vector(edges[i]))
+
+    # Determine if angle between edges is less than 110 or obtuse and assign to corresponding boundary point index
+    angle_small = []
+    for i in range(len(boundary_pts)-1):
+        acute_boolean = calculate_if_angle_between_edges_is_smaller_than_110(unit_vecs[i], rev_vector(unit_vecs[(i-1) % len(unit_vecs)]))
+        angle_small.append(acute_boolean)
+
+    # Split corner dim lists
+    cp_dim_duo = []
+    cp_dim_trio = []
+
+    # Iterate over the original list and sort based on the length of each nested list
+    for dimension_pair in cp_dim_pairs:
+        if len(dimension_pair) == 3:
+            cp_dim_trio.append(dimension_pair)
+        elif len(dimension_pair) == 2:
+            cp_dim_duo.append(dimension_pair)
+
+
+    ##############################
+    """ CREATE CORNER PARCELS """
+
+    # Configurations for while loop
+    i = 0 # Initialize the loop counter i
+    max_iterations = len(boundary_pts) * 2  # Allow for double the length of boundary points as a safeguard
+    safeguard = 0 #  Initialize safeguard to prevent infinite loops
+    first_iteration = True
+    stored_width = 0
+
+    # Iterate over each corner
+    while i < (len(boundary_pts)-1) and safeguard < max_iterations:
+        
+        # Increment safeguard to track progress
+        safeguard += 1
+
+        # For legibility of code
+        j = (i-1) % len(edges) 
+        k = (i+1) % len(edges)
+
+        if first_iteration:
+            control_dist = edges[j][0].DistanceTo(edges[j][1])
+            if control_dist <= penta_threshold:
+                first_iteration = False
+                continue
+            else:
+                first_iteration = False
+
+        # Establish edge distances
+        edge_distance_1 = edges[i][0].DistanceTo(edges[i][1])
+        edge_distance_2 = edges[j][0].DistanceTo(edges[j][1])
+        edge_distance_3 = edges[k][0].DistanceTo(edges[k][1])  
+
+
+        # Assign corner config based upon threshold
+        control_dist = edges[i][0].DistanceTo(edges[i][1])
+        if control_dist > penta_threshold:
+            corner_parcel_type = "quadrilateral"
+            
+        elif control_dist <= penta_threshold:
+            corner_parcel_type = "pentalateral"
+            
+
+        # Create quadrilateral corner parcel
+        if corner_parcel_type == "quadrilateral" and angle_small[i] == True: 
+            
+            # Get relevant angles of boundary polygon
+            bp_angle = calculate_angle_between_edges(rev_vector(unit_vecs[j]), unit_vecs[i])
+
+            # Generate random width and height for each corner parcel based upon the corner dimensions
+            cp_dim_choice = random.choice(cp_dim_duo)
+            cp_dim_local = rg.Interval(cp_dim_choice[0], cp_dim_choice[1])
+ 
+            # If assigned domain exceeds half of edges dimensions, cap the width
+            corner_width_1, corner_width_2 = apply_deviation_within_domain(corner_dim, cp_dim_local, deviation_percentage=0.25)
+            if edge_distance_1/2 < corner_width_1:
+                corner_width_1 = round(random.uniform(edge_distance_1 * (1/4), edge_distance_1 * (1/3)))
+            elif edge_distance_2/2 < corner_width_2:
+                corner_width_2 = round(random.uniform(edge_distance_2 * (1/4), edge_distance_2 * (1/3)))
+
+            # Get angles
+            r = random.randint(0, (len(cp_angles)-1))
+            angle_1 = cp_angles[r][0]
+            angle_2 = cp_angles[r][1]
+
+            # Avoid overlap if angle is very acute
+            if bp_angle <= 80:
+                angle_1 = 90
+                angle_2 = 90
+                if corner_width_1 > corner_width_2:
+                    corner_width_2 = random.uniform(corner_width_1 * 0.7, corner_width_1 * 0.9)
+                else:
+                    corner_width_1 = random.uniform(corner_width_2 * 0.7, corner_width_2 * 0.9)
+
+            # Adjust corner parcel angles if boundary polygon angle is obtuse
+            if bp_angle >= 100:
+                angle_correction = (bp_angle - random.uniform(85, 95)) * 0.5
+                angle_2 = angle_2 - angle_correction
+                     
+            # Control stored width
+            if corner_width_2 > edge_distance_1 - stored_width:
+                corner_width_2 = stored_width                     
+            
+            # Construct polyline vertices
+            cp_0 = edges[i][0] 
+            cp_1 = rs.PointAdd(cp_0, unit_vecs[i] * corner_width_1)
+            cp_3 = rs.PointAdd(cp_0, rev_vector(unit_vecs[j]) * corner_width_2)
+            cp_2 = find_intersection(cp_1, angle_vec(edges[i][0], edges[i][1], angle_1), cp_3, angle_vec(edges[j][0], edges[j][1], angle_2))
+
+            # Create quadrilateral polyline
+            corner_polyline = [cp_0, cp_1, cp_2, cp_3, cp_0]
+            corner_parcels.append(rs.AddPolyline(corner_polyline))
+            cp_vertices.append(corner_polyline)
+            cp_config.append("quadrilateral")
+
+            # Increment loop counter by 1
+            i += 1
+
+            # Store width to compare in next iteration
+            stored_width = corner_width_1
+
+        # Create pentalateral corner parcels if angle is larger than 110°
+        elif corner_parcel_type == "quadrilateral" and angle_small[i] == False:
+
+
+            cp_dim_choice = random.choice(cp_dim_duo)
+            cp_dim_local = rg.Interval(cp_dim_choice[0], cp_dim_choice[1])
+
+            # If assigned domain exceeds half of edges dimensions, cap the width
+            corner_width_1, corner_width_2 = apply_deviation_within_domain(corner_dim, cp_dim_local, deviation_percentage=0.25)
+            if edge_distance_1/2 < corner_width_1:
+                corner_width_1 = round(random.uniform(edge_distance_1 * (1/4), edge_distance_1 * (1/3)))
+                print("ok")
+            elif edge_distance_2/2 < corner_width_2:
+                corner_width_2 = round(random.uniform(edge_distance_2 * (1/4), edge_distance_2 * (1/3)))
+
+            # Control geometry by limiting height between corner widths
+            corner_height = random.uniform(corner_width_1, corner_width_2)
+
+            # Get angles
+            r = random.randint(0, (len(cp_angles)-1))
+            angle_1 = cp_angles[r][0]
+            angle_2 = cp_angles[r][1]
+
+            # Construct polyline vertices
+            cp_0 = edges[i][0]
+            cp_1 = rs.PointAdd(cp_0, unit_vecs[i] * corner_width_1)
+            cp_2 = rs.PointAdd(cp_1, angle_vec(edges[i][0], edges[i][1], angle_1) * corner_height)
+            cp_4 = rs.PointAdd(cp_0, rev_vector(unit_vecs[j]) * corner_width_2)
+            cp_3 = rs.PointAdd(cp_4, angle_vec(edges[j][0], edges[j][1], angle_2) * corner_height)
+
+            # Determine possible intersection(s) to ensure appropriate geometry of corner parcel
+            control_curve_1 = rg.Polyline([cp_1, cp_2]).ToNurbsCurve() 
+            control_curve_2 = rg.Polyline([cp_3, cp_4]).ToNurbsCurve()
+            intersection = rg.Intersect.Intersection.CurveCurve(control_curve_1, control_curve_2, tolerance, tolerance)
+
+            # If the curves do not intersect, create pentalateral corner parcel
+            if intersection.Count == 0:
+                corner_polyline = [cp_0, cp_1, cp_2, cp_3, cp_4, cp_0]
+                corner_parcels.append(rs.AddPolyline(corner_polyline)) # Construct current iteration of corner
+                cp_vertices.append(corner_polyline)
+                cp_config.append("pentalateral_1c")
+                test = cp_0
+
+            # If they intersect (since corner_height is too large) create quadrilateral parcel instead, even if the boundary edges' angle is obtuse
+            elif intersection[0].IsPoint:
+                cp_2 = intersection[0].PointA
+                cp_3 = cp_4  # Adjust index, so that it is consistent with the other quadrilateral corner parcels
+                corner_polyline = [cp_0, cp_1, cp_2, cp_3, cp_0]
+                corner_parcels.append(rs.AddPolyline(corner_polyline))
+                cp_vertices.append(corner_polyline)
+                cp_config.append("quadrilateral")  
+
+            # Increment loop counter by 1
+            i += 1
+
+
+        # Create pentalateral corner parcel
+        elif corner_parcel_type == "pentalateral":
+
+            # Get relevant angles of boundary polygon
+            bp_angle_1 = calculate_angle_between_edges(rev_vector(unit_vecs[j]), unit_vecs[i])
+            bp_angle_2 = calculate_angle_between_edges(rev_vector(unit_vecs[i]), unit_vecs[k])
+
+            # Generate random width and height for each corner parcel based upon the corner dimensions
+            # Establish reference with control distance (and look in cp dim trios)
+            corresponding_dim = find_closest_values(cp_dim_trio, control_dist)
+            cp_dim_local = rg.Interval(corresponding_dim[0], corresponding_dim[1])
+            corner_width_1, corner_width_2 = apply_deviation_within_domain(corner_dim, cp_dim_local, deviation_percentage=0.3)
+
+            # Adjust dimensions according to edge distance
+            if corner_width_1 < edge_distance_1/2:
+                corner_width_1 = random.uniform(edge_distance_1 * (1/2), edge_distance_1*(3/4))
+            if corner_width_2 < edge_distance_1/2:
+                corner_width_2 = random.uniform(edge_distance_1 * (1/2), edge_distance_1*(3/4))
+
+            # Make sure that the widths don't deviate too much from each other
+            corner_width_2 = random.uniform(corner_width_1 * 0.8, corner_width_2 * 1.2)
+
+            # Adjust widths corresponding to angle deviation for reasonable results
+            if bp_angle_1 > 90:
+                corner_ratio = 90/bp_angle_1
+                corner_width_2 *= corner_ratio * (random.uniform(0.8, 0.9))
+            if bp_angle_2 > 90:
+                corner_ratio = 90/bp_angle_2
+                corner_width_1 *= corner_ratio * (random.uniform(0.8, 0.9))
+
+            # Get angles
+            r = random.randint(0, (len(cp_angles)-1))
+            angle_1 = cp_angles[r][0]
+            angle_2 = cp_angles[r][1]
+
+            # Construct polyline vertices
+            cp_0 = edges[i][0]
+            cp_1 = edges[i][1]
+            cp_2 = rs.PointAdd(cp_1, unit_vecs[k] * corner_width_1)
+            cp_4 = rs.PointAdd(cp_0, rev_vector(unit_vecs[j]) * corner_width_2)
+            cp_3 = find_intersection(cp_2, angle_vec(edges[k][0], edges[k][1], angle_1), cp_4, angle_vec(edges[j][0], edges[j][1], angle_2))
+
+            # Create pentalateral polyline
+            corner_polyline = [cp_0, cp_1, cp_2, cp_3, cp_4, cp_0]
+            corner_parcels.append(rs.AddPolyline(corner_polyline))
+            cp_vertices.append(corner_polyline)
+            cp_config.append("pentalateral_2c")
+
+            # Increment loop counter by 2
+            i += 2
+
+
+
+    ##############################
+    """ SETTING THE SCENE TO CREATE GENERIC PARCELS """
+
+    # Get distances between the corner parcels
+    cp_distances = []
+
+    for i in range(len(cp_vertices)):
+        # For legibility of code
+        j = (i-1) % len(cp_vertices) 
+        k = (i+1) % len(cp_vertices)
+        # Get start point of distance
+        if cp_config[i] == "quadrilateral" or cp_config[i] == "pentalateral_1c":
+            start_pt = cp_vertices[i][1]
+        elif cp_config[i] == "pentalateral_2c":
+            start_pt = cp_vertices[i][2]
+        # Get end point of distance
+        if cp_config[k] == "quadrilateral":
+            end_pt = cp_vertices[k][3]
+        elif cp_config[k] == "pentalateral_1c" or cp_config[k] == "pentalateral_2c":
+            end_pt = cp_vertices[k][4]
+        # Get distance
+        distance = rs.Distance(start_pt, end_pt)
+        cp_distances.append(distance)
+
+    # Get generic parcel indentation count based upon indentation_reference_length
+    gp_indentation_count = []
+
+    # Get generic parcel counts based upon minimum and maximum gp_lengths
+    gp_on_edge_count = []
+
+    for cp_distance in cp_distances:
+
+        # Get a random value in the lower and upper bound of gp_lengths
+        length_dom_low = int(random.uniform(gp_lengths_domain[0] + (gp_lengths_mean - gp_lengths_domain[0])*(3/4), gp_lengths_mean))
+        length_dom_upper = int(random.uniform(gp_lengths_mean, gp_lengths_domain[1] - (gp_lengths_domain[1] - gp_lengths_mean)*(3/4)))
+
+        # Create bounds (these are somewhat arbitrary)
+        indentation_ref_lower_bound = int(random.uniform(length_dom_low, indentation_reference_length * 0.8))
+        indentation_ref_upper_bound = int(random.uniform(indentation_reference_length * 1.2, length_dom_upper))
+
+        # Get generic parcel counts
+        ref_length_gp_counts = random.choice([length_dom_low, length_dom_upper])
+        
+        # Ensure ref_length_gp_counts is smaller than cp_distance to avoid excessive counts
+        if ref_length_gp_counts >= cp_distance:
+            ref_length_gp_counts = cp_distance * 0.9  # Ensure it's a bit smaller than cp_distance
+        
+        gp_count = max(1, cp_distance // ref_length_gp_counts)  # Ensure minimum gp_count is 1
+        gp_on_edge_count.append(int(gp_count))
+        
+        # Get indentation counts
+        ref_length_indentation = round(random.uniform(indentation_ref_lower_bound, indentation_ref_upper_bound), 2)
+        
+        # Ensure ref_length_indentation is smaller than cp_distance to avoid negative indentation count
+        if ref_length_indentation >= cp_distance:
+            ref_length_indentation = cp_distance * 0.8  # Ensure it's a bit smaller than cp_distance
+
+        if ref_length_indentation != 0: 
+            indentation_count = cp_distance // ref_length_indentation
+        else:
+            indentation_count = 2
+        
+        # Avoid negative indentation count and ensure it doesn't exceed gp_count
+        if indentation_count > (gp_count - 1):
+            gp_indentation_count.append(int(gp_count - 1))
+        else:
+            gp_indentation_count.append(int(max(0, indentation_count)))
+
+
+    # Ensure no overlap between the adjacent edges:
+    control_cp_distance = min(cp_distances)/2
+    if (control_cp_distance) < gp_widths_domain[1]:
+        gp_widths_domain_cap = round(control_cp_distance*(3/4), 2)
+    else:
+        gp_widths_domain_cap = gp_widths_domain[1]
+
+
+
+    ##############################
+    """ CREATE GENERIC PARCELS """
+
+    # ASSIGN WIDTHS OF GENERIC PARCELS
+
+    unbounded = random.choice([False, True])
+    avoid_overlap = False
+    last_dim_diff = 0
+
+    # Iterate through all corner parcels
+    for i in range(len(corner_parcels)):
+
+        # For legibility of code
+        j = (i+1) % len(corner_parcels) 
+
+        # Avoid overlap in last chunck of generic parcel generation
+        if i == (len(corner_parcels) - 1):
+            unbounded = False
+
+        # Apply start pointsand cp_angle_1 according to cp_config
+        if cp_config[i] == "quadrilateral" or cp_config[i] == "pentalateral_1c":
+            strip_start_pt_bot = cp_vertices[i][1]
+            strip_start_pt_top = cp_vertices[i][2]
+            cp_angle_1 = calculate_angle_between_lines(cp_vertices[i][2], cp_vertices[i][1], cp_vertices[i][3])
+        elif cp_config[i] == "pentalateral_2c":
+            strip_start_pt_bot = cp_vertices[i][2]
+            strip_start_pt_top = cp_vertices[i][3]
+            cp_angle_1 = calculate_angle_between_lines(cp_vertices[i][3], cp_vertices[i][2], cp_vertices[i][4])
+
+        # Apply end points and cp_angle_2 according to cp_config
+        if cp_config[j] == "quadrilateral":
+            strip_end_pt_bot = cp_vertices[j][3]
+            strip_end_pt_top = cp_vertices[j][2]
+            cp_angle_2 = calculate_angle_between_lines(cp_vertices[j][2], cp_vertices[j][1], cp_vertices[j][3])
+        elif cp_config[j] == "pentalateral_1c" or cp_config[j] == "pentalateral_2c":
+            strip_end_pt_bot = cp_vertices[j][4]
+            strip_end_pt_top = cp_vertices[j][3]
+            cp_angle_2 = calculate_angle_between_lines(cp_vertices[j][3], cp_vertices[j][2], cp_vertices[j][4])
+
+        # Create the geometric domain, in which the generic parcels can be generated (strips)
+        strip_length_bot = rs.Distance(strip_start_pt_bot, strip_end_pt_bot)
+        strip_length_top = rs.Distance(strip_start_pt_top, strip_end_pt_top)
+        strip_width_1 = rs.Distance(strip_start_pt_bot, strip_start_pt_top)
+        strip_width_2 = rs.Distance(strip_end_pt_bot, strip_end_pt_top)
+
+        # Append first width separately (to avoid overlap)
+        if gp_indentation_count[i] == 0 and gp_widths_domain[0] > strip_width_2:
+            first_gp_width = strip_width_2
+        elif cp_angle_1 > 90:
+            first_gp_width = strip_width_1
+        elif cp_angle_1 <= 90 and cp_angle_2 <= 90 and avoid_overlap == False and i != (len(gp_indentation_count) - 1):
+            first_gp_width = random.uniform(gp_widths_domain[0], gp_widths_domain_cap)
+        else:
+            first_gp_width = random.uniform(gp_widths_domain[0], strip_width_1)
+        first_gp_length = find_matching_lengths(gp_dim_pairs, first_gp_width)
+        if first_gp_length < last_dim_diff:
+            first_gp_length = random.uniform(last_dim_diff, gp_lengths_domain[1])
+        
+        # Initialize generic parcel widths
+        gp_widths = [first_gp_width] 
+
+        # Append as many width values as the indentation count
+        for indent in range(gp_indentation_count[i]):
+            
+            if unbounded == False:
+                if indent == gp_indentation_count[i] - 1: 
+                    if gp_widths_domain[0] > strip_width_2:
+                        gp_widths.append(strip_width_2)
+                    else:
+                        gp_widths.append(random.uniform(gp_widths_domain[0], strip_width_2))
+                elif strip_width_1 > strip_width_2:
+                    gp_widths.append(random.uniform(gp_widths_domain[0], strip_width_2))
+                else:
+                    gp_widths.append(random.uniform(gp_widths_domain[0], strip_width_1))
+
+            elif indent == gp_indentation_count[i] - 1:
+                if gp_widths_domain[0] > strip_width_2:
+                    gp_widths.append(strip_width_2)
+                else:
+                    gp_widths.append(random.uniform(gp_widths_domain[0], strip_width_2))
+
+            elif cp_angle_1 > 90:         
+                gp_random_width = round(random.gauss(gp_widths_mean, gp_widths_sd), 2)
+                domain_control = cp_vertices[j][1].DistanceTo(cp_vertices[j][2]) + cp_vertices[j][2].DistanceTo(cp_vertices[j][3]) 
+                if domain_control < gp_widths_domain_cap:
+                    maximum_domain = domain_control
+                elif domain_control >= gp_widths_domain_cap:
+                    maximum_domain = gp_widths_domain_cap
+                gp_width = max(gp_widths_domain[0], min(gp_random_width, maximum_domain), 2)
+                gp_widths.append(round(max(first_gp_width, min(gp_width, maximum_domain)), 2)) # Clamp the random width to the domain
+
+            elif cp_angle_1 < 90 or cp_angle_2 < 90:
+                gp_widths.append(strip_width_1 if strip_width_1 > strip_width_2 else strip_width_2)
+                unbounded = True
+
+            else:
+                gp_widths.append(round(random.uniform(gp_widths_domain[0],gp_widths_domain_cap), 2))
+
+        # Pass over "avoid overlap" boolean for next loop
+        last_width = gp_widths[len(gp_widths)-1]
+        last_dim_diff = last_width - strip_width_2
+        if last_dim_diff > 0:
+            avoid_overlap = True
+        
+        # Every iteration shifts unbounded (to avoid overlap)
+        unbounded = not unbounded
+
+        # Make sure that no width falls below 5m
+        for min_idx in range(len(gp_widths)-1):
+            if gp_widths[min_idx] < 5:
+                gp_widths[min_idx] = 5
+
+        # Hard code the width if there is only one parcel
+        if len(gp_widths) == 1:
+            gp_widths = []
+            if strip_width_1 <= strip_width_2:
+                hardcoded_width = random.uniform(strip_width_1*(3/4), strip_width_1)
+            else:
+                hardcoded_width = random.uniform(strip_width_2*(3/4), strip_width_2) 
+            gp_widths.append(hardcoded_width)
+
+
+        # ASSIGN LENGHTS OF GENERIC PARCEL
+
+        # Ensure that first gp length is long enough (to avoid overlap)
+        if first_gp_length < last_dim_diff:
+            first_gp_length = last_dim_diff
+
+        # Create generic parcel lengths
+        gp_lengths = [first_gp_length]
+
+        # Append as many length values as the gp_on_edge_count
+        for amount in range(gp_on_edge_count[i]-1):
+            gp_random_length = round(random.gauss(gp_lengths_mean, gp_lengths_sd), 2)
+            gp_length = max(gp_lengths_domain[0], min(gp_random_length, gp_lengths_domain[1]))
+            gp_lengths.append(gp_length)
+
+        # Adjust the generated parcel lengths to ensure their sum matches the length of strip_length_bot
+        total_gp_length = sum(gp_lengths)
+        scaling_factor = strip_length_bot / total_gp_length
+
+        # Scale the lengths to match the total length of strip_length_bot
+        gp_lengths_front = [gp_length * scaling_factor for gp_length in gp_lengths]
+
+        # Clamp the values to ensure they fall within the domain
+        for n in range(len(gp_lengths_front)):
+            if gp_lengths_front[n] < gp_lengths_domain[0]:
+                gp_lengths_front[n] = gp_lengths_domain[0]
+            elif gp_lengths_front[n] > gp_lengths_domain[1]:
+                gp_lengths_front[n] = gp_lengths_domain[1]
+        total_length_after_adjustment = sum(gp_lengths_front)
+        deviation = total_length_after_adjustment - strip_length_bot
+
+        # Subtract deviation from the largest length in the list
+        if deviation != 0:
+            max_index = gp_lengths_front.index(max(gp_lengths_front))
+            gp_lengths_front[max_index] -= deviation
+
+        # Calculate proportions of parcel lengths to strip lengths and ensure same proportional distribution for strip rear end
+        proportions = [length / strip_length_bot for length in gp_lengths_front]
+        gp_lengths_back = [prop * strip_length_top for prop in proportions]
+
+
+        # CONSTRUCT GENERIC PARCELS
+
+        # Initialize vectors for parcel construction
+        gp_vec_front = rg.Vector3d(strip_end_pt_bot.X - strip_start_pt_bot.X, strip_end_pt_bot.Y - strip_start_pt_bot.Y, 0)
+        gp_vec_front.Unitize()
+        gp_vec_back = rg.Vector3d(strip_end_pt_top.X - strip_start_pt_top.X, strip_end_pt_top.Y - strip_start_pt_top.Y, 0)
+        gp_vec_back.Unitize()
+        gp_vec_side_1 = rg.Vector3d(strip_start_pt_top.X - strip_start_pt_bot.X, strip_start_pt_top.Y - strip_start_pt_bot.Y, 0)
+        gp_vec_side_1.Unitize()
+        gp_vec_side_2 = rg.Vector3d(strip_end_pt_top.X - strip_end_pt_bot.X, strip_end_pt_top.Y - strip_end_pt_bot.Y, 0)
+        gp_vec_side_2.Unitize()
+
+        # Assign widths according to indentation count
+        indentation_bool = [True] * (gp_indentation_count[i]) + [False] * ((gp_on_edge_count[i] - gp_indentation_count[i]) - 2)
+        random.shuffle(indentation_bool)
+        indentation_bool = [False] + indentation_bool + [False]
+        assigned_widths = []
+        idx = 0
+        for n in range(gp_on_edge_count[i]):
+            if indentation_bool[n] == True:
+                idx = min(idx + 1, len(gp_widths) - 1)
+            assigned_widths.append(gp_widths[idx])
+        
+        # Initialize lists to store cumulative lengths
+        front_offset = 0
+        back_offset = 0
+
+        # Create generic parcels by iterating through the lengths
+        for n in range(len(gp_lengths_front)):
+
+            # If there is only one very slender generic parcel between corner parcels, skip that parcel
+            if len(gp_lengths_front) == 1 and gp_lengths_front[n] < 5:
+                continue
+
+            # Skip the parcel if it is shorter than 4 meters
+            if gp_lengths_front[n] < 4:
+                continue
+
+            # Calculate an interpolation factor based on the current offset:
+            t_1 = front_offset / strip_length_bot
+            # Interpolate the side vector between gp_vec_side_1 and gp_vec_side_2
+            gp_vec_side_interpolated_1 = interpolate_vectors(gp_vec_side_1, gp_vec_side_2, t_1)
+
+            # Calculate an interpolation factor based on the current offset:
+            t_2 = (front_offset + gp_lengths_front[n]) / strip_length_bot
+            # Interpolate the side vector between gp_vec_side_1 and gp_vec_side_2
+            gp_vec_side_interpolated_2 = interpolate_vectors(gp_vec_side_1, gp_vec_side_2, t_2)
+
+            # Calculate the back side reference point based on the assigned width from the gp_widths pool
+            back_ref_pt = rs.PointAdd(strip_start_pt_bot, gp_vec_side_interpolated_2 * assigned_widths[n])
+
+            # Calculate the points for the parcel based on the cumulative offsets
+            front_start = rs.PointAdd(strip_start_pt_bot, gp_vec_front * front_offset)
+            front_end = rs.PointAdd(strip_start_pt_bot, gp_vec_front * (front_offset + gp_lengths_front[n])) 
+            back_start = rs.PointAdd(front_start, gp_vec_side_interpolated_1 * assigned_widths[n])
+            back_end = rs.PointAdd(front_end, gp_vec_side_interpolated_2 * assigned_widths[n])
+            test = back_start
+            # back_end = rs.PointAdd(back_ref_pt, gp_vec_front * (back_offset + gp_lengths_back[n]))
+
+            # Define the parcel points
+            generic_parcel = [
+                front_start,
+                front_end,
+                back_end,
+                back_start,
+                front_start
+            ]
+
+            # Add the polyline for the parcel
+            generic_parcels.append(rs.AddPolyline(generic_parcel))
+
+            # Update the offsets for the next parcel
+            front_offset += gp_lengths_front[n]
+            back_offset += gp_lengths_back[n]
+
+
+
+    ###############
+    """ OUTPUTS """
+
+    # Append corner parcels and generic parcels, such that it can be read by building generation component
+    all_parcel_list_for_bg = corner_parcels + generic_parcels
+    all_parcels_building_generation.append(all_parcel_list_for_bg)
+
+    # Append corner parcels and generic parcels to all parcels
+    for cp in corner_parcels:
+        all_parcels.append(cp)
+    for gp in generic_parcels:
+        all_parcels.append(gp)
