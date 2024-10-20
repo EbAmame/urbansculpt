@@ -1,0 +1,73 @@
+# Get Heights Component
+# Required inputs:
+# Either "buildings_3D", which should be Brep extrusion GUIDs (set input to list access)
+# Or mean_height, min_height, max_height and height_std (integers of floats)
+
+
+import Rhino
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import math
+
+#####################################################################################
+
+""" FUNCTIONS """
+
+# Function to retreive building height from 3D buildings
+def get_building_height(building_id):
+    # Get the bounding box of the object
+    bbox = rs.BoundingBox(building_id)
+    # Extract Z-coordinates of the bounding box corners
+    min_z = bbox[0].Z
+    max_z = bbox[4].Z
+    # Height is the difference between the maximum and minimum Z values
+    height = max_z - min_z
+    return height
+
+# Function to calculate mean
+def calculate_mean(data):
+    return sum(data) / len(data)
+
+# Function to calculate standard deviation
+def calculate_std(data):
+    mean = calculate_mean(data)
+    squared_differences = [(i - mean) ** 2 for i in data]  # Calculate squared differences
+    variance = sum(squared_differences) / len(data)  # Find the variance
+    return math.sqrt(variance)  # std = square root of the variance
+
+
+################################
+""" EXTRACT BUILDING HEIGHTS """
+
+# Analyze building 3D input
+if buildings_3D is not None:
+
+    # Initialize list to store building heights
+    building_heights = []
+
+    # Iterate through all buildings
+    for building in buildings_3D:
+        height = get_building_height(building)
+        building_heights.append(height)
+
+    bh_mean = round(calculate_mean(building_heights), 2)
+    bh_min = min(building_heights)
+    bh_max = max(building_heights)
+    bh_sd = round(calculate_std(building_heights), 2)
+
+# If there is no building 3D input
+else:
+    bh_mean = mean_height
+    bh_min = min_height
+    bh_max = max_height
+    bh_sd = height_std
+
+
+# Outputs
+
+height_info = [
+    bh_mean,
+    bh_min,
+    bh_max,
+    bh_sd
+]
