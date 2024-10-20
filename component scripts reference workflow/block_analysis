@@ -1,0 +1,870 @@
+# Block Analysis component
+
+# Required inputs:
+# 1. boundary (closed polyline curve GUID)
+# 2. parcels (closed polyline curve GUIDs, set input to list access)
+# 3. buildings_footprint (closed polyline curve GUIDs, set input to list access)
+# 4. height info (inherited data structure from Get Heights, set input to list access)
+
+# Important information:
+# Parcels must have at least one edge (or two vertices) coincident with boundary polygon
+# Parcels cannot intersect boundary polyon.
+# In order to map building, building curve cannot be outside of a parcel or range over two parcels
+# Building vertices must be either inside or coincident with parcel curve.
+
+
+
+import Rhino
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import random
+import math
+from collections import defaultdict
+
+#####################################################################################
+
+""" FUNCTIONS """
+
+# Function to calculate mean
+def calculate_mean(data):
+    return sum(data) / len(data)
+
+# Function to calculate standard deviation
+def calculate_std(data):
+    mean = calculate_mean(data)
+    squared_differences = [(i - mean) ** 2 for i in data]  # Calculate squared differences
+    variance = sum(squared_differences) / len(data)  # Find the variance
+    return math.sqrt(variance)  # std = square root of the variance
+
+# Function to compute the angles between the non-boundary edges and the boundary polygon edges of a corner parcel
+def compute_non_boundary_edge_angles(non_boundary_edges, boundary_polygon_edges, tolerance):
+    cp_edge_angles = []
+    # Iterate through all non-boundary edges
+    for nbe in non_boundary_edges:
+        nbe_start_pt = nbe.PointAtStart
+        nbe_end_pt = nbe.PointAtEnd    
+        # Iterate through boundary polygon edges to find the closest edge points
+        for edge in boundary_polygon_edges:
+            success_start, param_start = edge.ClosestPoint(nbe_start_pt)
+            success_end, param_end = edge.ClosestPoint(nbe_end_pt)           
+            # Get closest points on the edge if successful
+            edge_pt_1 = edge.PointAt(param_start) if success_start else None
+            edge_pt_2 = edge.PointAt(param_end) if success_end else None
+            # If both start and end points of nbe have close points on the boundary edge
+            if edge_pt_1 and edge_pt_2:
+                start_dist = nbe_start_pt.DistanceTo(edge_pt_1)
+                end_dist = nbe_end_pt.DistanceTo(edge_pt_2)
+                # Check if the start distance is within tolerance
+                if start_dist < tolerance:
+                    if nbe_start_pt.DistanceTo(edge.PointAtStart) < nbe_start_pt.DistanceTo(edge.PointAtEnd):
+                        vec_1 = rg.Vector3d(edge.PointAtStart.X - nbe_start_pt.X, edge.PointAtStart.Y - nbe_start_pt.Y, 0)
+                    else:
+                        vec_1 = rg.Vector3d(edge.PointAtEnd.X - nbe_start_pt.X, edge.PointAtEnd.Y - nbe_start_pt.Y, 0)
+                    vec_2 = rg.Vector3d(nbe_end_pt.X - nbe_start_pt.X, nbe_end_pt.Y - nbe_start_pt.Y, 0)                   
+                    vec_1.Unitize()
+                    vec_2.Unitize()
+                    angle_degrees = math.degrees(rg.Vector3d.VectorAngle(vec_1, vec_2))
+                    cp_edge_angles.append(round(angle_degrees))
+                # Check if the end distance is within tolerance
+                elif end_dist < tolerance:
+                    if nbe_end_pt.DistanceTo(edge.PointAtStart) < nbe_end_pt.DistanceTo(edge.PointAtEnd):
+                        vec_1 = rg.Vector3d(edge.PointAtStart.X - nbe_end_pt.X, edge.PointAtStart.Y - nbe_end_pt.Y, 0)
+                    else:
+                        vec_1 = rg.Vector3d(edge.PointAtEnd.X - nbe_end_pt.X, edge.PointAtEnd.Y - nbe_end_pt.Y, 0)
+                    vec_2 = rg.Vector3d(nbe_start_pt.X - nbe_end_pt.X, nbe_start_pt.Y - nbe_end_pt.Y, 0)
+                    vec_1.Unitize()
+                    vec_2.Unitize()
+                    angle_degrees = math.degrees(rg.Vector3d.VectorAngle(vec_1, vec_2))
+                    cp_edge_angles.append(round(angle_degrees))
+    # Returns list of angles (in degrees) between the non-boundary edges and boundary edges
+    return cp_edge_angles
+
+# Function to create lines that interpolate between two opposite edges
+def interpolate_between_edges(edge1, edge2, grid_resolution):
+    points = []
+    for i in range(grid_resolution + 1):
+        step = i / grid_resolution
+        start = edge1.PointAt(step)
+        end = edge2.PointAt(step)
+        points.append(rg.Line(start, end))
+    return points
+
+# Function to ensure the vertices of the parcel are ordered counter-clockwise.
+def ensure_counterclockwise(parcel):
+    polyline = parcel.ToPolyline()
+    vertices = polyline.ToArray()  # Get vertices as an array
+    signed_area_sum = 0
+    # Shoelace theorem to check clockwise or counter-clockwise
+    for i in range(len(vertices)):
+        v1 = vertices[i]
+        v2 = vertices[(i + 1) % len(vertices)]  # Next vertex (with wrap-around)
+        signed_area_sum += (v2.X - v1.X) * (v2.Y + v1.Y)
+    # If total is positive, the vertices are ordered clockwise
+    if signed_area_sum > 0:
+        vertices = list(reversed(vertices))  # Reverse the vertices if clockwise
+        return rg.PolylineCurve(vertices)  # Return the polyline with counter-clockwise vertices
+    else:
+        return parcel  # Already counter-clockwise, return the original parcel
+
+# Function to reorder vertices such that the first vertex is closest to corner and ensure counterclockwise order.
+def reorder_vertices_to_start_at_corner(vertices, corner, tolerance=1e-6):  
+    # Find the index of the vertex closest to the corner
+    min_distance = float("inf")
+    vertex_0_index = 0
+    for i in range(len(vertices)):
+        distance = vertices[i].DistanceTo(corner)
+        if distance < min_distance:
+            min_distance = distance
+            vertex_0_index = i
+    # Reorder the vertices starting from the closest point
+    reordered_vertices = [vertices[(i + vertex_0_index) % len(vertices)] for i in range(len(vertices))]
+    # Remove consecutive duplicate vertices (within a small tolerance)
+    unique_reordered_vertices = [reordered_vertices[0]]
+    for i in range(1, len(vertices)):
+        if reordered_vertices[i].DistanceTo(unique_reordered_vertices[-1]) > tolerance:
+            unique_reordered_vertices.append(reordered_vertices[i])
+    # Ensure the last vertex is not a duplicate of the first vertex
+    if unique_reordered_vertices[0].DistanceTo(unique_reordered_vertices[-1]) < tolerance:
+        unique_reordered_vertices.pop()
+    # Check if the reordered vertices are counterclockwise using the Shoelace theorem
+    signed_area_sum = 0
+    for i in range(len(unique_reordered_vertices)):
+        v1 = unique_reordered_vertices[i]
+        v2 = unique_reordered_vertices[(i + 1) % len(unique_reordered_vertices)]  # Next vertex (with wrap-around)
+        signed_area_sum += (v2.X - v1.X) * (v2.Y + v1.Y)
+    if signed_area_sum > 0:
+        unique_reordered_vertices.reverse()
+    else:
+        unique_reordered_vertices = unique_reordered_vertices
+    return unique_reordered_vertices
+
+
+
+### Functions used for quadrilateral building mapping ###
+
+# Function to generate a grid inside a quadrilateral parcel. Uses a bilinear interpolation between the edges of the quadrilateral.
+def generate_grid_in_quadrilateral_parcel(parcel_vertices, grid_resolution):
+    grid_points = []
+    parcel_vertices.pop()
+    # Get the four corners of the quadrilateral
+    v0, v1, v2, v3 = parcel_vertices
+    for u in range(grid_resolution + 1):
+        u_ratio = u / grid_resolution  # The relative position along the U direction (horizontal)
+        # Interpolate between v0->v3 (left) and v1->v2 (right) edges
+        left_interp = v0 + (v3 - v0) * u_ratio
+        right_interp = v1 + (v2 - v1) * u_ratio
+        for v in range(grid_resolution + 1):
+            v_ratio = v / grid_resolution  # The relative position along the V direction (vertical)
+            # Interpolate between the left and right edges at the current u_ratio
+            grid_point = left_interp + (right_interp - left_interp) * v_ratio
+            grid_points.append(grid_point)
+    return grid_points
+
+# Function to map the building vertices to the indices of the grid points of the quadrilateral parcel.
+def compute_building_indeces_quadrilateral(building_vertices, grid_in):
+    building_indices = []
+    for building_vertex in building_vertices:
+        # Find the closest point in the input grid and get its index
+        closest_index_in = min(range(len(grid_in)), key=lambda i: building_vertex.DistanceTo(grid_in[i]))
+        building_indices.append(closest_index_in)
+    # Returns a list of indices that represent the mapping.
+    return building_indices
+
+
+### Functions used for pentalateral building mapping ###
+
+# Function to compute the centroid (geometric center) of a list of 3D points (vertices).
+def compute_centroid(vertices):
+    sum_x = sum(v.X for v in vertices)
+    sum_y = sum(v.Y for v in vertices)
+    sum_z = sum(v.Z for v in vertices)
+    num_vertices = len(vertices)
+    return rg.Point3d(sum_x / num_vertices, sum_y / num_vertices, sum_z / num_vertices)
+
+# Function to subdivide a triangle into four smaller triangles by adding midpoints on its edges.
+def subdivide_triangle(v0, v1, v2):
+    # Compute midpoints
+    mid_v0_v1 = v0 + (v1 - v0) * 0.5
+    mid_v1_v2 = v1 + (v2 - v1) * 0.5
+    mid_v2_v0 = v2 + (v0 - v2) * 0.5
+    # Create smaller triangles
+    triangles = [
+        (v0, mid_v0_v1, mid_v2_v0),
+        (mid_v0_v1, v1, mid_v1_v2),
+        (mid_v2_v0, mid_v1_v2, v2),
+        (mid_v0_v1, mid_v1_v2, mid_v2_v0)
+    ]
+    # Return triangles and midpoints as potential intersection points
+    return triangles, [mid_v0_v1, mid_v1_v2, mid_v2_v0]
+
+# Function to subdivide the triangles of a pentalateral parcel iteratively with consistent indexing.
+def generate_grid_in_pentalateral_parcel(vertices, center):
+    # Create initial triangles (center to adjacent vertices)
+    triangles = []
+    indexed_points = []  # Track points in a consistent order
+    indexed_points.append(center)  # Start with the centroid having index 0
+    iterations = 3
+    # Add the original vertices with consistent indexing
+    indexed_points.extend(vertices)  # Add pentagon vertices (these will get indices 1-5)
+    for i in range(len(vertices)):
+        v0 = vertices[i]
+        v1 = vertices[(i + 1) % len(vertices)]
+        triangles.append((center, v0, v1))
+    # Subdivide the triangles iteratively
+    for _ in range(iterations):
+        new_triangles = []
+        for tri in triangles:
+            # Subdivide the triangle and get the new midpoints
+            subdivided, midpoints = subdivide_triangle(*tri)
+            # Check each midpoint and assign it an index if it's new
+            for midpoint in midpoints:
+                if midpoint not in indexed_points:
+                    indexed_points.append(midpoint)
+            new_triangles.extend(subdivided)
+        triangles = new_triangles
+    # Returns the subdivided triangles and indexed intersection points.
+    return triangles, indexed_points
+
+# Function to map the building vertices to the indices of the sorted points of the pentalateral parcel.
+def compute_building_indeces_pentalateral(building_vertices, sorted_points_in):
+    building_indices = []
+    for building_vertex in building_vertices:
+        # Find the closest point in the sorted_points_in and get its index
+        closest_index_in = min(range(len(sorted_points_in)), key=lambda i: building_vertex.DistanceTo(sorted_points_in[i]))
+        building_indices.append(closest_index_in)
+    # Returns a list of indices that represent the mapping.
+    return building_indices
+
+
+#####################################################################################
+
+# SHORTCUTS FOR LEGIBILITY:
+# generic_parcels: "gp"
+# corner_parcels: "gp"
+
+
+###################################
+""" INPUTS, LISTS AND CONSTANTS """
+
+# Inputs
+boundary_polygon = boundary  # The large boundary polygon that surrounds all parcels (as a closed curve)
+all_parcels = parcels  # List of (irregular) rectangular parcel curves (from the "List Access" in Grasshopper)
+buildings = buildings_footprint # List of building footprints
+if height_info is not None:
+    height_info = height_info
+else:
+    print("standard building heights will be used")
+
+# Initialize lists for outputs
+corner_parcels = []  # List to store corner parcels (Rhino.Geometry type: PolylineCurve)
+generic_parcels = []  # List to store generic parcels (Rhino.Geometry type: PolylineCurve)
+gp_lengths = []  # List to store generic parcels lengths (the edge, that is adjacent to the boundary polygon)
+gp_widths = [] # List to store generic parcels widths (one of the edges, that is connected to the boundary polygon)
+gp_nb_edges = [] # List to store all generic parcels' non-boundary edges (for indentation count)
+cp_lengths = [] # List to store the corner parcels lengths (for the two edges adjacent to the boundary polygon)
+cp_edge_angle = [] # List to store corner parcel angles
+cp_configurations = []
+
+# Set tolerance for geometric comparison
+tolerance = 1e-3
+
+# Set grid resolution for mapping (shouldn't be set higher than 50 for acceptable performance)
+grid_resolution = 30
+
+#######################
+""" PARCEL ANALYSIS """
+
+
+# Ensure the boundary_polygon is a valid curve
+if rs.IsCurve(boundary_polygon) and boundary_polygon is not None:
+    boundary_curve = rs.coercecurve(boundary_polygon)  # Convert the boundary polygon to a RhinoCommon curve
+    boundary_curve = ensure_counterclockwise(boundary_curve)
+
+    # Explode the boundary_polygon into individual edges
+    boundary_polygon_corners = boundary_curve.ToPolyline().ToArray()
+    boundary_polygon_edges = boundary_curve.DuplicateSegments()
+    
+    # Initialize empty lists for further analysis and mapping
+    gp_on_boundary_edge_count = [0] * len(boundary_polygon_edges)
+    gp_map_to_edge = [[] for _ in range(len(boundary_polygon_edges))]
+    gp_edge_on_boundary_edge = [[] for _ in range(len(boundary_polygon_edges))]
+
+
+    # Iterate over each parcel curve, received from the input
+    for parcel in all_parcels:
+        
+        # Convert parcels to RhinoCommon curve (PolylineCurve) and ensure counterclockwise order
+        parcel_curve = rs.coercecurve(parcel)
+        parcel_curve = ensure_counterclockwise(parcel_curve)
+        parcel_vertices = parcel_curve.ToPolyline().ToArray() 
+
+        # Explode the parcel into individual segments (edges)
+        parcel_edges = parcel_curve.DuplicateSegments()
+        boundary_edges = []  # To hold the edges of the iterated parcel that lie on the boundary polygon
+        non_boundary_edges = []  # To hold the non-boundary edges
+
+
+        # Check each edge of the parcel to see if it lies close to the boundary polygon
+        for edge in parcel_edges:
+            start_pt = edge.PointAtStart
+            end_pt = edge.PointAtEnd
+
+            # Find the closest points on the boundary polygon to the start and end points of the edge
+            success_start, param_start = boundary_curve.ClosestPoint(start_pt)
+            success_end, param_end = boundary_curve.ClosestPoint(end_pt)
+
+            # Construct points on the boundary polygon to compute distance
+            boundary_pt_1 = boundary_curve.PointAt(param_start) if success_start else None
+            boundary_pt_2 = boundary_curve.PointAt(param_end) if success_end else None
+
+            # Compare the distance between the parcel edge and the boundary polygon
+            if boundary_pt_1 and boundary_pt_2:
+                start_dist = start_pt.DistanceTo(boundary_pt_1)
+                end_dist = end_pt.DistanceTo(boundary_pt_2)
+
+                # If both distances are within the tolerance, consider it a boundary edge
+                if start_dist < tolerance and end_dist < tolerance:
+                    boundary_edges.append(edge)
+
+                else:
+                    non_boundary_edges.append(edge)
+
+
+
+        # Generic parcel has one boundary edge
+        if len(boundary_edges) == 1:
+            length = boundary_edges[0].GetLength()
+            gp_lengths.append(length)
+            generic_parcels.append(parcel_curve)
+            
+            # Add the boundary edge to the respective boundary polygon edge's generic parcels count
+            start_pt = boundary_edges[0].PointAtStart
+            end_pt = boundary_edges[0].PointAtEnd
+            for i, boundary_line in enumerate(boundary_polygon_edges):
+                success_start, param_start = boundary_line.ClosestPoint(start_pt)
+                success_end, param_end = boundary_line.ClosestPoint(end_pt)
+                boundary_line_pt_1 = boundary_line.PointAt(param_start) if success_start else None
+                boundary_line_pt_2 = boundary_line.PointAt(param_end) if success_end else None
+                if boundary_line_pt_1 and boundary_line_pt_2:
+                    start_dist = start_pt.DistanceTo(boundary_line_pt_1)
+                    end_dist = end_pt.DistanceTo(boundary_line_pt_2)
+                    if start_dist < tolerance and end_dist < tolerance:
+                        gp_on_boundary_edge_count[i] += 1
+                        gp_map_to_edge[i].append(parcel)
+                        gp_edge_on_boundary_edge[i].append(boundary_edges[0])
+
+            # For generic parcels, find the two non-boundary edges connected to the boundary edge
+            connected_non_boundary_edges = []
+            for edge in non_boundary_edges:
+                if (edge.PointAtStart in [boundary_edges[0].PointAtStart, boundary_edges[0].PointAtEnd] or
+                    edge.PointAtEnd in [boundary_edges[0].PointAtStart, boundary_edges[0].PointAtEnd]):
+                    connected_non_boundary_edges.append(edge)
+                    gp_nb_edges.append(edge)
+
+            # Ensure we have exactly two connected non-boundary edges
+            # If the connected non boundary edges differ in length, assign the minimum of both
+            if len(connected_non_boundary_edges) == 2:
+                width = min(connected_non_boundary_edges[0].GetLength(), connected_non_boundary_edges[1].GetLength()) # here condition for crooked line
+                gp_widths.append(width)
+
+
+        # Corner parcel has two boundary edges, if quadrilateral
+        elif len(boundary_edges) == 2: 
+            if len(parcel_vertices) == 5:
+                cp_configurations.append("quadrilateral")           
+                cp_lengths.append([boundary_edges[0].GetLength(), boundary_edges[1].GetLength()])
+                corner_parcels.append(parcel_curve)
+                cp_vertices = parcel_curve.ToPolyline().ToArray()
+                angles = compute_non_boundary_edge_angles(non_boundary_edges, boundary_polygon_edges, tolerance)
+                cp_edge_angle.append(angles)
+            elif len(parcel_vertices) == 6:
+                cp_configurations.append("pentalateral")           
+                cp_lengths.append([boundary_edges[0].GetLength(), boundary_edges[1].GetLength(), boundary_edges[0].GetLength()])
+                corner_parcels.append(parcel_curve)
+                cp_vertices = parcel_curve.ToPolyline().ToArray()
+                angles = compute_non_boundary_edge_angles(non_boundary_edges, boundary_polygon_edges, tolerance)
+                cp_edge_angle.append(angles)   
+
+
+        # Corner parcel has three boundary edges, if pentalateral
+        elif len(boundary_edges) == 3: 
+            cp_configurations.append("pentalateral")           
+            cp_lengths.append([boundary_edges[0].GetLength(), boundary_edges[1].GetLength(), boundary_edges[2].GetLength()])
+            corner_parcels.append(parcel_curve)
+            cp_vertices = parcel_curve.ToPolyline().ToArray()
+            angles = compute_non_boundary_edge_angles(non_boundary_edges, boundary_polygon_edges, tolerance)
+            cp_edge_angle.append(angles)
+
+
+    # Sort the non boundary edges (or the widths) of the generic parcels to the corresponding boundary polygon edge
+    gp_nb_edges_sorted = [[] for _ in range(len(boundary_polygon_edges))] 
+    for edge in gp_nb_edges:
+        start_pt = edge.PointAtStart
+        end_pt = edge.PointAtEnd
+        for i, boundary_line in enumerate(boundary_polygon_edges):
+            success_start, param_start = boundary_line.ClosestPoint(start_pt)
+            success_end, param_end = boundary_line.ClosestPoint(end_pt)
+            boundary_line_pt_1 = boundary_line.PointAt(param_start) if success_start else None
+            boundary_line_pt_2 = boundary_line.PointAt(param_end) if success_end else None
+            if boundary_line_pt_1 and boundary_line_pt_2:
+                start_dist = start_pt.DistanceTo(boundary_line_pt_1)
+                end_dist = end_pt.DistanceTo(boundary_line_pt_2)
+                if start_dist < tolerance or end_dist < tolerance:
+                    gp_nb_edges_sorted[i].append(edge)
+
+
+    
+    # Initialize generic parcel indentation count on the back
+    # This means, the amount of indentations that occur over all rear sides of the parcels that are aligned to one edge
+    gp_indentation_count = [0] * len(boundary_polygon_edges)
+    parcel_lengths = []
+    for i in range(len(boundary_polygon_edges)):
+        edge_infos = [[] for _ in range(len(gp_nb_edges_sorted[i]))]
+        point_to_edges = defaultdict(list)
+        # Default dictionary to store edges grouped by shared points
+        # Automatically initializes a default value for a new key when you try to access it for the first time 
+        # Store edge start and end points and lengths
+        for m, edge in enumerate(gp_nb_edges_sorted[i]):
+            edge_start = edge.PointAtStart
+            edge_end = edge.PointAtEnd
+            edge_length = edge.GetLength()
+            # Append edge data to the list
+            edge_infos[m].append(edge_start)
+            edge_infos[m].append(edge_end)
+            edge_infos[m].append(edge_length)
+            # Group edges by shared points (both start and end points)
+            # If edge_start is not in the dictionary, defaultdict(list) will automatically create an empty list for this key
+            point_to_edges[edge_start].append(edge_length)
+            point_to_edges[edge_end].append(edge_length)
+        # Compare the lengths of edges that share points
+        for point, lengths in point_to_edges.items():
+            if len(lengths) > 1:  # Only compare if multiple edges share this point
+                if len(set(lengths)) > 1:  # If there are different lengths, increment the counter
+                    gp_indentation_count[i] += 1
+        # Get the sum of boundary edge lengths to establish proportion
+        boundary_edge_lengths = 0
+        for gp_edge in gp_edge_on_boundary_edge[i]:
+            boundary_edge_lengths += gp_edge.GetLength()
+        parcel_lengths.append(boundary_edge_lengths)
+
+
+    # Find out average length for when indentation occurs
+    numerator = 0
+    denominator = 0
+    if gp_indentation_count[i] < 0:
+        for i in range(len(parcel_lengths)):
+            # Skip if parcel_lengths[i] = 0 (pentalateral corner parcel)
+            if parcel_lengths[i] < tolerance:
+                continue
+            elif gp_indentation_count == 0: 
+                numerator += parcel_lengths[i]
+                denominator += 1
+            else:
+                numerator += (parcel_lengths[i] / gp_indentation_count[i])
+                denominator += 1
+        indentation_ratio = round(numerator/denominator,2)
+    else:
+        indentation_ratio = parcel_lengths[0]
+        
+
+    #########################
+    """ BUILDING ANALYSIS """
+
+    # Dictionary to store parcel to building mapping
+    gp_to_building_map = defaultdict(list)  # Mapping from (edge_index, gp_index) -> list of buildings
+    cp_to_building_map = [[] for _ in range(len(corner_parcels))]  
+
+    # For all buildings, get building vertices
+    for building in buildings:
+        building_curve = rs.coercecurve(building)
+        building_points = building_curve.ToPolyline().ToArray()   # Convert the curve into a polyline
+
+        # Map buildings to generic parcels of corresponding edge
+        for i in range(len(boundary_polygon_edges)):
+            for j in range(len(gp_map_to_edge[i])):
+                inside = True
+                # Coerce the generic parcel curve of the corresponding edge
+                gp_check = rs.coercecurve(gp_map_to_edge[i][j])
+                for pt in building_points:
+                    result = gp_check.Contains(pt, rg.Plane.WorldXY, tolerance)
+                    if result != rg.PointContainment.Inside and result != rg.PointContainment.Coincident:
+                        inside = False  # Set to False if any point is outside
+                        break  # If any point is outside, stop checking further
+                if inside:
+                    # Append the building to the corresponding parcel in the generic parcel mapping
+                    gp_to_building_map[(i, j)].append(building_curve)
+
+        # Map buildings to corner parcels
+        for i in range(len(corner_parcels)):  # Iterate over corner parcels
+            inside = True
+            # Coerce the corner parcel curve of the corresponding corner
+            cp_check = rs.coercecurve(corner_parcels[i])
+            for pt in building_points:
+                result = cp_check.Contains(pt, rg.Plane.WorldXY, tolerance)
+                if result != rg.PointContainment.Inside and result != rg.PointContainment.Coincident:
+                    inside = False  # Set to False if any point is outside
+                    break  # If any point is outside, stop checking further
+            if inside:
+                # Append the building to the corresponding parcel in the corner parcel mapping
+                cp_to_building_map[i].append(building_curve)
+
+
+    #####################################################
+    """ SETTING THE SCENE FOR CORNER BUILDING MAPPING """
+
+    # Establish the reference point, from which the reordering of the vertices should take place
+    cp_nb_edges_sorted = [[] for _ in range(len(corner_parcels))] 
+    for i, parcel in enumerate(corner_parcels):
+        parcel = rs.coercecurve(parcel)
+        parcel_edges = parcel.DuplicateSegments()
+        for edge in parcel_edges:
+            start_pt = edge.PointAtStart
+            end_pt = edge.PointAtEnd
+            matched = False # Flag
+            # Iterate over boundary polygon edges to find matching ones
+            for boundary_line in boundary_polygon_edges:
+                success_start, param_start = boundary_line.ClosestPoint(start_pt)
+                success_end, param_end = boundary_line.ClosestPoint(end_pt)
+                boundary_line_pt_1 = boundary_line.PointAt(param_start) if success_start else None
+                boundary_line_pt_2 = boundary_line.PointAt(param_end) if success_end else None
+                if boundary_line_pt_1 and boundary_line_pt_2:
+                    start_dist = start_pt.DistanceTo(boundary_line_pt_1)
+                    end_dist = end_pt.DistanceTo(boundary_line_pt_2)
+                    if start_dist < tolerance and end_dist < tolerance:
+                        matched = True  # Mark as matched
+                        break  # No need to check further boundary lines once matched
+            # If no match was found after all boundary lines, append to placeholder
+            if matched == False:
+                cp_nb_edges_sorted[i].append(edge)
+
+    # Get non_boundary_points as first reference
+    non_boundary_points = []
+    for i in range(len(cp_nb_edges_sorted)):
+        edge_1= cp_nb_edges_sorted[i][0]
+        edge_2 = cp_nb_edges_sorted[i][1]
+        intersection_events = rg.Intersect.Intersection.CurveCurve(edge_1, edge_2, 0.001, 0.0)
+        if intersection_events:
+            for event in intersection_events:
+                if event.IsPoint:
+                    intersection_point = event.PointA
+                    non_boundary_point = rg.Point3d(intersection_point.X, intersection_point.Y, intersection_point.Z)  # Create Point3d
+                    non_boundary_points.append(non_boundary_point) 
+
+    # Assign corner distance threshold, after which we receive pentalateral parcel
+    penta_corner_distances = []
+
+    # Reorder vertices, such that they consistently start at reference corner
+    for i, parcel in enumerate(corner_parcels):
+        parcel = rs.coercecurve(parcel)
+        parcel = ensure_counterclockwise(parcel)
+        vertices = parcel.ToPolyline().ToArray()
+        vertices_ccw = reorder_vertices_to_start_at_corner(vertices, non_boundary_points[i])
+        if cp_configurations[i] == "quadrilateral":
+            reordered_vertices = [vertices_ccw[2], vertices_ccw[3], vertices_ccw[0], vertices_ccw[1], vertices_ccw[2]]
+            reordered_parcel = rg.PolylineCurve(reordered_vertices)
+        elif cp_configurations[i] == "pentalateral":
+            reordered_vertices = [vertices_ccw[2], vertices_ccw[3], vertices_ccw[4], vertices_ccw[0], vertices_ccw[1], vertices_ccw[2]]
+            reordered_parcel = rg.PolylineCurve(reordered_vertices)
+            penta_corner_distances.append(reordered_vertices[0].DistanceTo(reordered_vertices[1]))
+
+    if penta_corner_distances:
+        penta_threshold = round(max(penta_corner_distances) * 1.2,2)
+    else:
+        penta_threshold = 20
+
+    ###############################
+    """ CORNER BUILDING MAPPING """
+
+    # Initialize list for corner building UV mapping (each element will be a nested list: dimensions + buildings)
+    corner_buildings_map = []
+
+    # Initialize list of corner parcel areas (and ensure identical index, to map complex buildings correctly)
+    cp_areas = []
+
+    # Initialize corner parcel dimension pairs
+    cp_dimension_pairs = []
+
+    # Iterate through all corner parcels and create the building map
+    # Index "i" refers to the index of the corner parcel
+    for i, buildings in enumerate(cp_to_building_map):
+        parcel = corner_parcels[i]  # Access the corresponding parcel 
+        parcel = rs.coercecurve(parcel)
+        parcel = ensure_counterclockwise(parcel)
+        parcel_area = round(rs.CurveArea(parcel)[0], 2)
+        cp_areas.append(parcel_area)
+        vertices = parcel.ToPolyline().ToArray()
+        corner = boundary_polygon_corners[i]  # Access the corresponding corner
+
+        # Reorder the vertices of the corner parcel
+        vertices_ccw = reorder_vertices_to_start_at_corner(vertices, non_boundary_points[i])
+
+        # Initialize a new list to store the dimension pair and building mappings for this parcel
+        parcel_info = []
+
+        # Map buildings in quadrilateral corner parcels
+        if cp_configurations[i] == "quadrilateral":
+            # Reorder vertices of quadrilateral corner parcel
+            reordered_vertices = [vertices_ccw[2], vertices_ccw[3], vertices_ccw[0], vertices_ccw[1], vertices_ccw[2]]
+            reordered_parcel = rg.PolylineCurve(reordered_vertices)
+
+            # Get dimension pair of quadrilateral corner parcel
+            cp_dim_1 = round(reordered_vertices[0].DistanceTo(reordered_vertices[1]), 2)
+            cp_dim_2 = round(reordered_vertices[1].DistanceTo(reordered_vertices[2]), 2)
+            cp_dimensions = [cp_dim_1, cp_dim_2]  # Dimensions for quadrilateral parcel
+            cp_dimension_pairs.append(cp_dimensions)
+
+            # Add the dimension pair as the first element in the list
+            parcel_info.append(cp_dimensions)
+
+            # Add aspect ratio as the second element in the list
+            aspect_ratio = round(cp_dim_1 / cp_dim_2, 2)
+            parcel_info.append(aspect_ratio)
+
+            # Generate a UV mapping grid for the quadrilateral corner parcel
+            grid_points = generate_grid_in_quadrilateral_parcel(reordered_vertices, grid_resolution)
+
+            # Initialize mapping_info to ensure it's a list
+            mapping_info = []
+
+            mapping_info = []
+            # Loop through all buildings inside this parcel
+            for building in buildings:
+                building_curve = rs.coercecurve(building)
+                building_vertices = list(building_curve.ToPolyline().ToArray())
+                # Compute the U-V coordinates of the footprint vertices within the grid
+                #compute_building_indeces_quadrilateral(building_vertices, grid_in)
+                building_mapping = compute_building_indeces_quadrilateral(building_vertices, grid_points)
+                
+                mapping_info.append(building_mapping)
+
+            # Add the mapping info list to parcel info (ensuring one nested list for all mappings)
+            parcel_info.append(mapping_info)
+
+        # Map buildings in pentalateral corner parcels
+        elif cp_configurations[i] == "pentalateral":
+            # Reorder vertices of pentalateral corner parcel
+            reordered_vertices = [vertices_ccw[2], vertices_ccw[3], vertices_ccw[4], vertices_ccw[0], vertices_ccw[1], vertices_ccw[2]]
+            reordered_parcel = rg.PolylineCurve(reordered_vertices)
+
+            # Get dimension trio of pentalateral corner parcel
+            cp_dim_1 = round(reordered_vertices[0].DistanceTo(reordered_vertices[1]), 2)
+            cp_dim_2 = round(reordered_vertices[1].DistanceTo(reordered_vertices[2]), 2)
+            cp_dim_3 = round(reordered_vertices[0].DistanceTo(reordered_vertices[4]), 2)
+            cp_dimensions = [cp_dim_1, cp_dim_2, cp_dim_3]  # Dimensions for pentalateral parcel
+            cp_dimension_pairs.append(cp_dimensions)
+
+            # Add the dimension trio as the first element in the list
+            parcel_info.append(cp_dimensions)
+
+            # Add aspect ratio as the second element in the list
+            aspect_ratio = round(cp_dim_1 / cp_dim_2, 2)
+            parcel_info.append(aspect_ratio)
+
+            # Generate a UV mapping grid for the pentalateral corner parcel
+            penta_center = compute_centroid(reordered_vertices)
+            triangles, indexed_points = generate_grid_in_pentalateral_parcel(reordered_vertices, penta_center)
+
+            mapping_info = []
+            # Loop through all buildings inside this parcel
+            for building in buildings:
+                building_curve = rs.coercecurve(building)
+                building_vertices = list(building_curve.ToArray())
+                # Compute the U-V coordinates of the footprint vertices within the grid
+                building_mapping = compute_building_indeces_pentalateral(building_vertices, indexed_points)
+                mapping_info.append(building_mapping)  # Add the building mapping
+            
+            # Add the mapping info list to parcel info (ensuring one nested list for all mappings)
+            parcel_info.append(mapping_info)
+        
+        # Add the list of parcel_info (dimension + building mappings) to the main list
+        corner_buildings_map.append(parcel_info)
+
+    # Remove last area from cp_areas if it is not equal
+    if len(cp_areas) > len(corner_parcels):
+        cp_areas.pop()
+    
+
+################################
+""" GENERIC BUILDING MAPPING """
+
+# Initialize list for generic building UV mapping (each element will be a nested list: dimensions + buildings)
+generic_buildings_map = []
+
+# Initialize list of generic parcel areas (and ensure identical index, to map complex buildings correctly)
+gp_areas = []
+
+# Initialize list of aspect ratios (where the length is in the numerator and the width is in the denominator)
+gp_dimension_pairs = []
+
+# Iterate through all generic parcels and create the building map
+for (i, j), buildings in gp_to_building_map.items():
+    parcel = gp_map_to_edge[i][j]  # Access the corresponding parcel 
+    parcel = rs.coercecurve(parcel)
+    parcel = ensure_counterclockwise(parcel)
+    parcel_area = round(rs.CurveArea(parcel)[0],2)
+    gp_areas.append(parcel_area)
+    vertices = parcel.ToPolyline().ToArray()
+    parcel_boundary_edge = gp_edge_on_boundary_edge[i][j]   # Access the corresponding boundary edge of the parcel
+    start_point = parcel_boundary_edge.PointAtStart         # Start point should be vertex at index 0 for reordered vertices
+    
+    # Reorder the vertices of the corner parcel, such that they are counterclockwise and the vertex at index "0" starts on the corner
+    reordered_vertices = reorder_vertices_to_start_at_corner(vertices, start_point)
+
+    # Initialize a new list to store the dimension pair and building mappings for this parcel
+    parcel_info = []
+
+    # Get dimension pairs
+    gp_length = round(reordered_vertices[0].DistanceTo(reordered_vertices[1]),2)
+    gp_width = round(reordered_vertices[1].DistanceTo(reordered_vertices[2]),2)
+    gp_dimensions = [gp_length, gp_width]
+    gp_dimension_pairs.append(gp_dimensions)
+
+    # Add the dimension pair as the first element in the list
+    parcel_info.append(gp_dimensions)
+
+    # Add aspect ratio as the second element in the list
+    aspect_ratio = round(gp_length / gp_width, 2)
+    parcel_info.append(aspect_ratio)
+
+    # Update the start and end points of the boundary edge if necessary
+    start_point = reordered_vertices[0]
+    end_point = reordered_vertices[1]  # Assuming the boundary edge is between the first two vertices
+
+    # Create consistent parcels for precise mapping of buildings
+    reordered_parcel_outline = [reordered_vertices[0], reordered_vertices[1], reordered_vertices[2], reordered_vertices[3], reordered_vertices[0]]
+    reordered_parcel = rg.PolylineCurve(reordered_parcel_outline)
+
+    # Generate a UV mapping grid for the parcel
+    grid_points = generate_grid_in_quadrilateral_parcel(reordered_parcel_outline, grid_resolution)
+    
+    mapping_info = []  # To store the building mappings
+
+    # Loop through all buildings inside this parcel
+    for building in buildings:
+        building_footprint = rs.coercecurve(building)
+        building_vertices = list(building_footprint.ToPolyline().ToArray())
+
+        # Compute the U-V coordinates of the footprint vertices within the grid
+        building_mapping = compute_building_indeces_quadrilateral(building_vertices, grid_points)
+        mapping_info.append(building_mapping)
+
+        # Get area ratio between building and parcel
+        parcel_area = rs.CurveArea(reordered_parcel)[0]  # Get the area of the parcel
+        building_area = rs.CurveArea(building)[0]        # Get the area of the building footprint
+        building_footprint_to_parcel_area_ratio = round((building_area / parcel_area), 2)
+
+    # Add the mapping info list as the second element in the list (index 1)
+    parcel_info.append(mapping_info)
+
+    # Add the list of parcel_info (dimension + building mappings) to the main list
+    generic_buildings_map.append(parcel_info)
+
+
+################
+""" OUTPUTS """
+
+### Determine key metrics for generic parcels
+gp_lengths_mean = calculate_mean(gp_lengths)
+gp_lengths_min = min(gp_lengths)
+gp_lengths_max = max(gp_lengths)
+gp_lengths_sd = calculate_std(gp_lengths)
+gp_widths_mean = calculate_mean(gp_widths)
+gp_widths_min = min(gp_widths)
+gp_widths_max = max(gp_widths)
+gp_widths_sd = calculate_std(gp_widths)
+
+### Determine key metrics for corner parcels
+cp_lengths_flattened = [item for sublist in cp_lengths for item in sublist]
+cp_edge_mean = calculate_mean(cp_lengths_flattened)
+cp_edge_min = min(cp_lengths_flattened)
+cp_edge_max = max(cp_lengths_flattened)
+cp_edge_sd = calculate_std(cp_lengths_flattened)
+
+### Determine key metrics for building height
+if height_info is not None:
+    bh_mean = height_info[0]
+    bh_min = height_info[1]
+    bh_max = height_info[2]
+    bh_sd = height_info[3]
+else:
+    bh_mean = 20
+    bh_min = 10
+    bh_max = 30
+    bh_sd = 5
+
+# Outputs
+cp_count = len(corner_parcels)
+gp_count = len(generic_parcels)
+gp_lengths = gp_lengths
+cp_lengths = cp_lengths
+cp_edge_max = cp_edge_max
+cp_edge_min = cp_edge_min
+boundary_area = rs.CurveArea(boundary_curve)
+boundary_area = round(boundary_area[0],2)
+
+
+data_text = [
+    f"Corner parcel configurations: {cp_configurations}",
+    f"Corner parcel count: {len(corner_parcels)}",
+    f"Corner parcel mean length: {round(cp_edge_mean, 2)}",
+    f"Corner parcel minimum length: {round(cp_edge_min, 2)}",
+    f"Corner parcel maximum length: {round(cp_edge_max, 2)}",
+    f"Corner parcel areas: {cp_areas}",
+    f"Generic parcel total count: {round(gp_count, 2)}",
+    f"Generic parcel mean length: {round(gp_lengths_mean, 2)}",
+    f"Generic parcel minimum length: {round(gp_lengths_min, 2)}",
+    f"Generic parcel maximum length: {round(gp_lengths_max, 2)}",
+    f"Generic parcel lengths standard deviation: {round(gp_lengths_sd, 2)}",
+    f"Generic parcel mean widths: {round(gp_widths_mean, 2)}",
+    f"Generic parcel minimum widths: {round(gp_widths_min, 2)}",
+    f"Generic parcel maximum widths: {round(gp_widths_max, 2)}",
+    f"Generic parcel widths standard deviation: {round(gp_widths_sd, 2)}",
+    f"Generic parcel count per boundary edge: {gp_on_boundary_edge_count}",
+    f"Generic parcel indentations per boundary edge: {gp_indentation_count}",    
+    f"Generic parcel dimension pairs (length = index 0, width = index 1): {gp_dimension_pairs}",
+    f"Generic parcel areas: {gp_areas}",
+    f"Generic parcel to building footprint area ratio: {building_footprint_to_parcel_area_ratio}",
+    f"Corner parcel dimension pairs: {cp_dimension_pairs}",
+    f"Average length after which an indentation occurs: {indentation_ratio}",
+    f"Length threshold, under which two corners create pentalateral: {penta_threshold}",
+    f"Corner parcel edges angles: {cp_edge_angle}",
+    f"Boundary Polygon Area: {boundary_area}",
+    f"Building mean height: {bh_mean}",
+    f"Building minimum height: {bh_min}",
+    f"Building maximum heigth: {bh_max}",
+    f"Building height standard deviation: {bh_sd}",
+    f"Buildings count: {len(buildings_footprint)}"
+]
+
+data_package = [
+    cp_configurations,
+    len(corner_parcels),
+    round(cp_edge_mean, 2),
+    round(cp_edge_min, 2),
+    round(cp_edge_max, 2),
+    cp_areas,
+    round(gp_count, 2),
+    round(gp_lengths_mean, 2),
+    [round(gp_lengths_min, 2)],
+    round(gp_lengths_max, 2),
+    round(gp_lengths_sd, 2),
+    round(gp_widths_mean, 2),
+    round(gp_widths_min, 2),
+    round(gp_widths_max, 2),
+    round(gp_widths_sd, 2),
+    gp_on_boundary_edge_count,
+    gp_indentation_count,
+    gp_dimension_pairs,
+    gp_areas,
+    building_footprint_to_parcel_area_ratio,
+    cp_dimension_pairs,
+    [indentation_ratio],
+    penta_threshold,
+    cp_edge_angle,
+    boundary_area,
+    bh_mean,
+    bh_min,
+    bh_max,
+    bh_sd,
+    len(buildings_footprint)
+]
