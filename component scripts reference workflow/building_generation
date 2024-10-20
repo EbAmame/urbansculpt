@@ -1,0 +1,761 @@
+# Building Generation Component
+
+# Required inputs:
+# 1. boundaries (closed polyline curve GUIDs, set input to list access)
+# 2. all_parcels_building_generation (received from Parcel Generation component)
+# 3. floor_area_ratio (integer or float)
+# 4. corner_buildings_map (data structure inherited from either Block Analysis or Merge Building Data components)
+# 5. generic_buildings_map (" ")
+# 6. data_package (from Block Analysis or Merge Parcel Data component)
+# 7. height_info (can be used instead of data_package, received from Get Heights component)
+# 8. random_seed (integer)
+
+# Required outputs:
+# 1. footprints (closed polyline curves)
+# 2. extrustions (Brep extrusions)
+
+
+import Rhino
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import Grasshopper
+import random
+
+#####################################################################################
+
+""" FUNCTIONS"""
+
+# Function to find the best match for each element in dimension pairs by calculating the deviation 
+def find_best_matches(dimensions_list, buildings_map, aspect_ratio_weight):
+    def_building_map = []
+    # Make a copy of the buildings_map to modify during iteration
+    available_buildings = buildings_map.copy() 
+    original_buildings = buildings_map.copy()  # Keep the original list to reset later
+    # Iterate through each dimension pair in dimensions_list
+    for i in range(len(dimensions_list)):
+        min_deviation = float("inf")
+        best_match_index = None
+        # Loop through each element in the available_buildings
+        for j in range(len(available_buildings)):
+            # Calculate the deviation for dimensions
+            dim_deviation = abs(dimensions_list[i][0][0] - available_buildings[j][0][0]) + abs(dimensions_list[i][0][1] - available_buildings[j][0][1])
+            # Calculate the aspect ratio deviation with aspect_ratio_weight
+            aspect_ratio_deviation = aspect_ratio_weight * abs(dimensions_list[i][1] - available_buildings[j][1])
+            # Calculate the total deviation
+            total_deviation = dim_deviation + aspect_ratio_deviation
+            # Check if this is the best match so far
+            if total_deviation < min_deviation:
+                min_deviation = total_deviation
+                best_match_index = j 
+        # Append the best match's building indices to def_building_map
+        if best_match_index is not None:
+            best_match = available_buildings[best_match_index]
+            def_building_map.append(best_match[2])  # Extract and append building indices
+            # Remove the matched building from available_buildings list so it can't be reused
+            available_buildings.pop(best_match_index)
+        # Reset the available_buildings list when its length is less than 2
+        if len(available_buildings) < 2:
+            available_buildings = original_buildings.copy()  # Reset to the original list
+    return def_building_map
+
+
+# Function to extrude polyline to closed brep
+def extrude_polyline(polyline_curve, height):
+    # Define tolerance
+    tolerance = 0.001
+    # Rebuild the polyline if necessary
+    if not polyline_curve.IsClosed:
+        polyline_curve.MakeClosed(tolerance)
+    # Ensure the curve is consistently oriented upwards (positive Z)
+    if not polyline_curve.ClosedCurveOrientation(rg.Plane.WorldXY) == rg.CurveOrientation.CounterClockwise:
+        polyline_curve.Reverse()
+    # Define the extrusion vector along the positive Z-axis, ensuring height is always positive
+    extrusion_vector = rg.Vector3d(0, 0, abs(height))
+    # Create the extrusion as an Extrusion object
+    extrusion = rg.Extrusion.Create(polyline_curve, abs(height), True)
+    # Convert the Extrusion object into a Brep
+    brep = extrusion.ToBrep()
+    # If the Brep is successfully created and is solid, return it
+    if brep and brep.IsSolid:
+        return brep
+    else:
+        # Try to cap planar holes if needed
+        capped_brep = brep.CapPlanarHoles(tolerance)
+        if capped_brep and capped_brep.IsSolid:
+            return capped_brep
+        else:
+            return brep
+
+
+# Function to check if any building footprint lies inside another and classify their relationship.
+def check_building_footprints_inside(building_footprints, building_vertices, tolerance):
+    # Initialize variables
+    building_footprint_inside = False
+    idx_outline_inside = None
+    idx_outline_surrounding = None
+    # Loop through all building footprints
+    for j, footprint in enumerate(building_footprints):
+        footprint = rs.coercecurve(footprint)
+        # Loop through all other building vertices to check containment
+        for k, vertices in enumerate(building_vertices):
+            if j == k:
+                continue
+            # Flag to track if any point is outside
+            is_outside = False
+            # Check each vertex of the footprint
+            for vertex in vertices:
+                result = footprint.Contains(vertex, rg.Plane.WorldXY, tolerance)
+                # If any point is outside, set the flag and break out of the loop
+                if result != rg.PointContainment.Inside and result != rg.PointContainment.Coincident:
+                    is_outside = True
+                    break  # Break out of the 'vertices' loop and go to the next set of 'vertices' (k)
+            # If any point was outside, skip to the next 'k'
+            if is_outside:
+                continue
+            # Otherwise, if no point is outside, consider the footprint as "inside"
+            building_footprint_inside = True
+            idx_outline_inside = k
+            idx_outline_surrounding = j
+            return building_footprint_inside, idx_outline_inside, idx_outline_surrounding
+    # Return results (False if no footprint was found inside another), and ints for the indeces
+    return building_footprint_inside, idx_outline_inside, idx_outline_surrounding
+
+
+# Clean mapped polyline if there are duplicate vertices
+def clean_polyline(polyline):
+    # Get the list of vertices of the polyline
+    vertices = list(polyline.ToNurbsCurve().Points)
+    # Check if the first and last vertices are the same
+    if vertices[0].Location.DistanceTo(vertices[-1].Location) < tolerance:
+        # Remove any consecutive duplicates from the end
+        while len(vertices) > 1 and vertices[-2].Location.DistanceTo(vertices[-1].Location) < tolerance:
+            vertices.pop(-1)
+    # Ensure the polyline is closed by adding the first vertex at the end
+    if vertices[0].Location.DistanceTo(vertices[-1].Location) >= tolerance:
+        vertices.append(vertices[0])
+    # Create a new polyline from the cleaned vertices
+    cleaned_curve = rg.Polyline([v.Location for v in vertices]).ToNurbsCurve()
+    return cleaned_curve
+
+
+### Functions used for quadrilateral building mapping ###
+
+# Function to extract vertices from a curve as a python list
+def extract_vertices_from_curve(quadrilateral_curve):
+    polyline = quadrilateral_curve.ToPolyline()
+    vertices = list(polyline.ToArray())
+    # Remove the last vertex if it's identical to the first vertex
+    if vertices[0].DistanceTo(vertices[-1]) < 1e-6:
+        vertices.pop()  # Remove the last vertex
+    return vertices
+
+# Function to generate a grid inside a quadrilateral parcel. Uses a bilinear interpolation between the edges of the quadrilateral.
+def generate_grid_in_quadrilateral_parcel(parcel_vertices, grid_resolution):
+    grid_points = []
+    # Get the four corners of the quadrilateral
+    v0, v1, v2, v3 = parcel_vertices
+    for u in range(grid_resolution + 1):
+        u_ratio = u / grid_resolution  # The relative position along the U direction (horizontal)
+        # Interpolate between v0->v3 (left) and v1->v2 (right) edges
+        left_interp = v0 + (v3 - v0) * u_ratio
+        right_interp = v1 + (v2 - v1) * u_ratio
+        for v in range(grid_resolution + 1):
+            v_ratio = v / grid_resolution  # The relative position along the V direction (vertical)
+            # Interpolate between the left and right edges at the current u_ratio
+            grid_point = left_interp + (right_interp - left_interp) * v_ratio
+            grid_points.append(grid_point)
+    return grid_points
+
+# Function to map the building indices to the corresponding points of the quadrilateral parcel's grid.
+def map_indices_to_points(building_indices, grid):
+    mapped_building_vertices = [grid[index] for index in building_indices]
+    return mapped_building_vertices
+
+
+
+### Functions used for pentalateral building mapping ###
+
+# Function to compute the centroid (geometric center) of a list of 3D points (vertices).
+def compute_centroid(vertices):
+    sum_x = sum(v.X for v in vertices)
+    sum_y = sum(v.Y for v in vertices)
+    sum_z = sum(v.Z for v in vertices)
+    num_vertices = len(vertices)
+    return rg.Point3d(sum_x / num_vertices, sum_y / num_vertices, sum_z / num_vertices)
+
+# Function to subdivide a triangle into four smaller triangles by adding midpoints on its edges.
+def subdivide_triangle(v0, v1, v2):
+    # Compute midpoints
+    mid_v0_v1 = v0 + (v1 - v0) * 0.5
+    mid_v1_v2 = v1 + (v2 - v1) * 0.5
+    mid_v2_v0 = v2 + (v0 - v2) * 0.5
+    # Create smaller triangles
+    triangles = [
+        (v0, mid_v0_v1, mid_v2_v0),
+        (mid_v0_v1, v1, mid_v1_v2),
+        (mid_v2_v0, mid_v1_v2, v2),
+        (mid_v0_v1, mid_v1_v2, mid_v2_v0)
+    ]
+    # Return triangles and midpoints as potential intersection points
+    return triangles, [mid_v0_v1, mid_v1_v2, mid_v2_v0]
+
+# Function to subdivide the triangles of a pentalateral parcel iteratively with consistent indexing.
+def generate_grid_in_pentalateral_parcel(vertices, center):
+    # Create initial triangles (center to adjacent vertices)
+    triangles = []
+    indexed_points = []  # Track points in a consistent order
+    indexed_points.append(center)  # Start with the centroid having index 0
+    iterations = 3
+    # Add the original vertices with consistent indexing
+    indexed_points.extend(vertices)  # Add pentagon vertices (these will get indices 1-5)
+    for i in range(len(vertices)):
+        v0 = vertices[i]
+        v1 = vertices[(i + 1) % len(vertices)]
+        triangles.append((center, v0, v1))
+    # Subdivide the triangles iteratively
+    for _ in range(iterations):
+        new_triangles = []
+        for tri in triangles:
+            # Subdivide the triangle and get the new midpoints
+            subdivided, midpoints = subdivide_triangle(*tri)
+            # Check each midpoint and assign it an index if it's new
+            for midpoint in midpoints:
+                if midpoint not in indexed_points:
+                    indexed_points.append(midpoint)
+            new_triangles.extend(subdivided)
+        triangles = new_triangles
+    # Returns the subdivided triangles and indexed intersection points.
+    return triangles, indexed_points
+
+
+#####################################################################################
+
+# SHORTCUTS FOR LEGIBILITY:
+# generic_parcels: "gp"
+# corner_parcels: "gp"
+
+
+###################################
+""" INPUTS, LISTS AND CONSTANTS """
+
+# Initialize outputs
+footprints = []
+extrusions = []
+
+# Iterate through all boundaries and respective parcels
+for i, boundary in enumerate(boundaries):
+
+    boundary = rs.coercecurve(boundary)
+
+    # Inputs
+    boundary_curve = boundary
+    boundary_area = round(rs.CurveArea(boundary_curve)[0], 2)
+    all_parcels_gh_curve_objects = all_parcels_building_generation[i]
+    all_parcels = []
+    for gh_curve in all_parcels_gh_curve_objects:
+        rhino_curve = gh_curve.Value
+        all_parcels.append(rhino_curve)
+
+    floor_area_ratio = float(floor_area_ratio)
+
+    # Extract height data from data package or Get Heights component
+    if not height_info:
+        b_mean_height = data_package[25]
+        b_min_height = data_package[26]
+        b_max_height = data_package[27]
+        b_height_std = data_package[28]
+    elif not data_package:
+        b_mean_height = height_info[0]
+        b_min_height = height_info[1]
+        b_max_height = height_info[2]
+        b_height_std = height_info[3]
+    else:
+        raise ValueError("Component requires data package or height info.")        
+
+    # Set tolerance for geometric comparison
+    tolerance = 1e-3
+
+    # Set grid resolution (for mapping). Must be the same as data anylsis component for proper mapping!
+    grid_resolution = 25
+
+    # Set random seed for reproducible results
+    random.seed(random_seed)
+
+    # Get the boundary polygon edges and vertices
+    boundary_pts = rs.PolylineVertices(boundary_curve)
+    if len(boundary_pts) < 4:
+        raise ValueError("Invalid Boundary, must have at least three vertices")
+    if boundary_pts[0] != boundary_pts[len(boundary_pts)-1]:
+        raise ValueError("Boundary Polygon must be a closed Polyline Curve")
+
+    # Split the corner_buildings_map to lists for pentalateral and quadrilateral corner parcels
+    cp_buildings_map_quad = []
+    cp_buildings_map_penta = []
+
+    for nested_list in corner_buildings_map:
+        if len(nested_list[0]) == 2:
+            cp_buildings_map_quad.append(nested_list)
+        elif len(nested_list[0]) == 3:
+            cp_buildings_map_penta.append(nested_list)
+
+
+
+    #######################
+    """ PARCEL ANALYSIS """
+
+    # Ensure the boundary_polygon is a valid curve
+    if rs.IsCurve(boundary_curve) and boundary_curve is not None:
+        boundary_curve = rs.coercecurve(boundary_curve)  # Convert the boundary polygon to a RhinoCommon curve
+
+        # Initialize lists to store polyline curves
+        gp_curves = []
+        cp_quad_curves = []
+        cp_penta_c1_curves = []
+        cp_penta_c2_curves = []
+
+        # Initialize lists to store vertices
+        gp_vertices = []
+        cp_quad_vertices = []
+        cp_penta_c1_vertices = []
+        cp_penta_c2_vertices = []
+
+        # Iterate over each parcel curve, received from the input
+        # Assign the iterated parcel to their respective list
+        for parcel in all_parcels:
+            parcel_curve = rs.coercecurve(parcel)  # Convert to RhinoCommon curve
+            parcel_vertices = parcel_curve.ToPolyline().ToArray()
+
+            # Explode the parcel into individual segments (edges)
+            parcel_edges = parcel_curve.DuplicateSegments()
+            boundary_edges = []  # To hold the edges of the parcel that lie on the boundary polygon
+
+            # Check each edge of the parcel to see if it lies close to the boundary polygon
+            for edge in parcel_edges:
+                start_pt = edge.PointAtStart
+                end_pt = edge.PointAtEnd
+
+                # Find the closest points on the boundary polygon to the start and end points of the edge
+                success_start, param_start = boundary_curve.ClosestPoint(start_pt)
+                success_end, param_end = boundary_curve.ClosestPoint(end_pt)
+
+                # Get the actual points on the boundary polygon for comparison
+                boundary_pt_1 = boundary_curve.PointAt(param_start) if success_start else None
+                boundary_pt_2 = boundary_curve.PointAt(param_end) if success_end else None
+
+                # Compare the distance between the parcel edge and the boundary polygon
+                if boundary_pt_1 and boundary_pt_2:
+                    start_dist = start_pt.DistanceTo(boundary_pt_1)
+                    end_dist = end_pt.DistanceTo(boundary_pt_2)
+
+                    # If both distances are within the tolerance, consider it a boundary edge
+                    if start_dist < tolerance and end_dist < tolerance:
+                        boundary_edges.append(edge)
+
+            # After checking the edges, classify each parcel based on the number of boundary edges
+            if len(boundary_edges) == 1:
+                gp_curves.append(parcel_curve)
+                gp_vertices.append(parcel_vertices)
+
+            elif len(boundary_edges) == 2:
+                if len(parcel_vertices) == 5:
+                    cp_quad_curves.append(parcel_curve)
+                    cp_quad_vertices.append(parcel_vertices)
+                elif len(parcel_vertices) == 6:
+                    cp_penta_c1_curves.append(parcel_curve)
+                    cp_penta_c1_vertices.append(parcel_vertices)
+                    
+            elif len(boundary_edges) == 3:
+                cp_penta_c2_curves.append(parcel_curve)
+                cp_penta_c2_vertices.append(parcel_vertices)
+
+    # Get dimensions duos or trios for comparison with building maps
+    gp_dim_pairs = []
+    for vertices in gp_vertices:
+        length = round(vertices[0].DistanceTo(vertices[1]),2)
+        width = round(vertices[1].DistanceTo(vertices[2]),2)
+        ratio = round(length / width, 2)
+        gp_dim_pairs.append([[length, width], ratio])
+
+    cp_quad_dim_pairs = []
+    for vertices in cp_quad_vertices:
+        width_1 = round(vertices[0].DistanceTo(vertices[1]),2)
+        width_2 = round(vertices[0].DistanceTo(vertices[3]),2)
+        ratio = round(width_1 / width_2, 2)
+        cp_quad_dim_pairs.append([[width_1, width_2], ratio])
+
+    cp_penta_dim_trios = []
+    for vertices in cp_penta_c1_vertices:
+        dim_1 = round(vertices[2].DistanceTo(vertices[3]),2)
+        dim_2 = round(vertices[3].DistanceTo(vertices[4]),2)
+        dim_3 = round(vertices[2].DistanceTo(vertices[1]),2)
+        ratio = round(dim_1 / dim_2, 2)
+        cp_penta_dim_trios.append([[dim_1, dim_2, dim_3], ratio])
+    for vertices in cp_penta_c2_vertices:
+        dim_1 = round(vertices[0].DistanceTo(vertices[1]),2)
+        dim_2 = round(vertices[1].DistanceTo(vertices[2]),2)
+        dim_3 = round(vertices[0].DistanceTo(vertices[4]),2)
+        ratio = round(dim_1 / dim_2, 2)
+        cp_penta_dim_trios.append([[dim_1, dim_2, dim_3], ratio])
+
+    # Add lists together (ensuring consistent index)
+    cp_penta_curves = cp_penta_c1_curves + cp_penta_c2_curves
+    cp_penta_vertices = cp_penta_c1_vertices + cp_penta_c2_vertices
+
+    # Determine new mean height based upon FAR. FAR is abbreviated with the entire parcel area, instead of building area.
+    if floor_area_ratio is not None:
+        # Get areas of parcels
+        gp_areas = []
+        for gp_curve in gp_curves:
+            gp_curve = rs.coercecurve(gp_curve)
+            gp_area = rs.CurveArea(gp_curve)
+            gp_areas.append(gp_area[0])
+
+        cp_quad_areas = []
+        for cp_curve in cp_quad_curves:
+            cp_curve = rs.coercecurve(cp_curve)
+            cp_area = rs.CurveArea(cp_curve)
+            cp_quad_areas.append(cp_area[0])
+
+        cp_penta_areas = []
+        for cp_curve in cp_penta_curves:
+            cp_curve = rs.coercecurve(cp_curve)
+            cp_area = rs.CurveArea(cp_curve)
+            cp_penta_areas.append(cp_area[0])    
+
+        all_areas = gp_areas + cp_quad_areas + cp_penta_areas
+        total_parcel_area = round(sum(all_areas), 2)
+        # Assumption: floor height = 2.5m
+        floor_height = 2.5
+        b_mean_height = boundary_area * floor_area_ratio * floor_height / total_parcel_area
+        if b_max_height < b_mean_height:
+            b_max_height = b_mean_height
+        if b_min_height > b_mean_height:
+            b_min_height = b_mean_height
+
+
+
+    #######################################
+    """ ASSING BUILDING MAPS TO PARCELS """
+
+    # When comparing the dimensions and aspect ratios, give aspect ratios more weight:
+    aspect_ratio_weight = 100
+
+    # Assign generic building map
+    gp_building_map = find_best_matches(gp_dim_pairs, generic_buildings_map, aspect_ratio_weight)
+
+    # Assign quadrilateral corner building map
+    cp_quad_building_map = find_best_matches(cp_quad_dim_pairs, cp_buildings_map_quad, aspect_ratio_weight)
+
+    # Assign pentalateral corner building map
+    if cp_penta_dim_trios:
+        cp_penta_building_map = find_best_matches(cp_penta_dim_trios, cp_buildings_map_penta, aspect_ratio_weight)
+    else:
+        print(cp_buildings_map_penta)
+        cp_penta_building_map = find_best_matches(cp_quad_dim_pairs, cp_buildings_map_penta, aspect_ratio_weight)
+
+
+
+    ################################
+    """ CREATE GENERIC BUILDINGS """
+
+    # Initialize list to store generic bulidings
+    generic_buildings_footprints = []
+    generic_buildings_3D = []
+
+    # Loop through all generic parcels
+    for i, generic_parcel in enumerate(gp_curves):
+
+        # Extract vertices from generic parcel
+        generic_parcel = rs.coercecurve(generic_parcel)
+        gp_vertices = extract_vertices_from_curve(generic_parcel)
+
+        # Generate grid for quadrilateral parcel
+        gp_grid = generate_grid_in_quadrilateral_parcel(gp_vertices, grid_resolution)
+
+        # Initialize lists for 3D building creation
+        building_footprints = []
+        building_vertices = []
+        building_dist_sum = []
+        building_vertices_distance_to_edge = [[] for _ in range(len(gp_building_map[i]))]
+
+        # Loop through all buildings on parcel
+        for j in range(len(gp_building_map[i])):
+            gp_building_indeces = gp_building_map[i][j]
+            mapped_building_vertices = map_indices_to_points(gp_building_indeces, gp_grid)
+
+            # Ensure the polyline is closed by appending the first vertex at the end if needed
+            if mapped_building_vertices[0].DistanceTo(mapped_building_vertices[-1]) > tolerance:
+                mapped_building_vertices.append(mapped_building_vertices[0])
+
+            # Create generic building footprint and append to generic building footprints
+            generic_building_outline = rs.AddPolyline(mapped_building_vertices)
+            generic_buildings_footprints.append(generic_building_outline)
+
+            # Measure distance of building footprints to edge
+            generic_building_curve = rs.coercecurve(generic_building_outline)
+            building_footprints.append(generic_building_curve)
+            gb_vertices = generic_building_curve.ToPolyline().ToArray()
+            building_vertices.append(gb_vertices)
+            for vertex in gb_vertices:
+                dist_1 = round(vertex.DistanceTo(gp_vertices[0]), 2)
+                dist_2 = round(vertex.DistanceTo(gp_vertices[1]), 2)
+                building_vertices_distance_to_edge[j].append(dist_1)
+                building_vertices_distance_to_edge[j].append(dist_2)
+
+        # Distance from boundary edge for reasonable height distribution
+        for j in range(len(building_vertices_distance_to_edge)):
+            weighted_dist = sum(building_vertices_distance_to_edge[j]) / len(building_vertices_distance_to_edge[j])
+            dist_sum = round(weighted_dist ,2)
+            building_dist_sum.append(dist_sum)
+
+        # Get a height from data package (or from the FAR calculation)
+        b_gauss_height = round(random.gauss(b_mean_height, b_height_std))
+        height = int(max(b_min_height, min(b_gauss_height, b_max_height)))
+
+        # Figure out if any footprint lies on another one
+        building_footprint_inside, idx_outline_inside, idx_outline_surrounding = check_building_footprints_inside(building_footprints, building_vertices, tolerance)
+
+        # Get a height from data package
+        b_gauss_height = round(random.gauss(b_mean_height, b_height_std))
+        height = int(max(b_min_height, min(b_gauss_height, b_max_height)))
+
+        # Create generic building extrustions
+        # Address the buildings with the outline inside:
+        if building_footprint_inside == True:
+            # First, address the buildings with the outline inside:
+            surrounding_footprint = rs.coercecurve(building_footprints[idx_outline_surrounding])
+            inside_footprint = rs.coercecurve(building_footprints[idx_outline_inside])
+            surrounding_building = extrude_polyline(surrounding_footprint, height)
+            inside_building = extrude_polyline(inside_footprint, height + 3)
+            generic_buildings_3D.append(surrounding_building)
+            generic_buildings_3D.append(inside_building)
+            height = height + random.choice([-3, 3])
+
+            # Delete the larger index first to avoid index shift issues
+            indices_to_remove = sorted([idx_outline_surrounding, idx_outline_inside], reverse=True)
+            for index in indices_to_remove:
+                for lst in [building_footprints, building_dist_sum]:
+                    del lst[index]
+
+        # Sort lists according to buliding distance to edge sum
+        if len(building_footprints) > 0:
+            sorted_pairs = sorted(zip(building_dist_sum, building_footprints), key=lambda x: x[0], reverse=True)
+            building_dist_sum, building_footprints = zip(*sorted_pairs)
+
+            for footprint in building_footprints:      
+                footprint = rs.coercecurve(footprint)
+                generic_building = extrude_polyline(footprint, height)
+                generic_buildings_3D.append(generic_building)
+                rng = random.uniform(0,1)
+                if rng < 0.2:
+                    if height > 6:
+                        height = height - 6
+                else:
+                    if height > 3:
+                        height = height - 3
+
+
+
+    ################################
+    """ CREATE CORNER BUILDINGS """
+
+    # Initialize list to store generic bulidings
+    corner_buildings_footprints = []
+    corner_buildings_3D = []
+
+    # Loop through all quadrilateral corner parcels
+    for i, corner_parcel_quad in enumerate(cp_quad_curves):
+
+        # Extract vertices from quadrilateral corner parcel
+        corner_parcel = rs.coercecurve(corner_parcel_quad)
+        cp_vertices = extract_vertices_from_curve(corner_parcel)
+
+        # Generate grid for quadrilateral parcel
+        cp_grid = generate_grid_in_quadrilateral_parcel(cp_vertices, grid_resolution)
+
+        # Initialize lists for 3D building creation
+        building_footprints = []
+        building_vertices = []
+        building_dist_sum = []
+        building_vertices_distance_to_edge = [[] for _ in range(len(cp_quad_building_map[i]))]   
+
+        # Loop through all buildings on parcel
+        for j in range(len(cp_quad_building_map[i])):
+            cp_building_indeces = cp_quad_building_map[i][j]
+            mapped_building_vertices = map_indices_to_points(cp_building_indeces, cp_grid)
+
+            # Ensure the polyline is closed by appending the first vertex at the end if needed
+            if mapped_building_vertices[0].DistanceTo(mapped_building_vertices[-1]) > tolerance:
+                mapped_building_vertices.append(mapped_building_vertices[0])
+
+            # Create corner building footprint and append to building footprints
+            corner_building_outline = rs.AddPolyline(mapped_building_vertices)
+            corner_buildings_footprints.append(corner_building_outline)
+
+            # Measure distance of building footprints edges
+            corner_building_curve = rs.coercecurve(corner_building_outline)
+            building_footprints.append(corner_building_curve)
+            cb_vertices = corner_building_curve.ToPolyline().ToArray()
+            building_vertices.append(cb_vertices)
+            for vertex in cb_vertices:
+                dist_1 = round(vertex.DistanceTo(cp_vertices[0]), 2)
+                dist_2 = round(vertex.DistanceTo(cp_vertices[1]), 2)
+                dist_3 = round(vertex.DistanceTo(cp_vertices[3]), 2)
+                building_vertices_distance_to_edge[j].append(dist_1)
+                building_vertices_distance_to_edge[j].append(dist_2)
+                building_vertices_distance_to_edge[j].append(dist_3)
+
+        # Distance from boundary edge for reasonable height distribution
+        for j in range(len(building_vertices_distance_to_edge)):
+            weighted_dist = sum(building_vertices_distance_to_edge[j]) / len(building_vertices_distance_to_edge[j])
+            dist_sum = round(weighted_dist ,2)
+            building_dist_sum.append(dist_sum)
+
+        # Get a height from data package (or from the FAR calculation)
+        b_gauss_height = round(random.gauss(b_mean_height, b_height_std))
+        height = int(max(b_min_height, min(b_gauss_height, b_max_height)))
+
+        # Figure out if any footprint lies on another one
+        building_footprint_inside, idx_outline_inside, idx_outline_surrounding = check_building_footprints_inside(building_footprints, building_vertices, tolerance)
+
+        # Create corner building extrustions
+        # Address the buildings with the outline inside:
+        if building_footprint_inside == True:
+            surrounding_footprint = rs.coercecurve(building_footprints[idx_outline_surrounding])
+            surrounding_footprint = clean_polyline(surrounding_footprint)
+            inside_footprint = rs.coercecurve(building_footprints[idx_outline_inside])
+            inside_footprint = clean_polyline(inside_footprint)
+            surrounding_building = extrude_polyline(surrounding_footprint, height)
+            inside_building = extrude_polyline(inside_footprint, height + 3)
+            corner_buildings_3D.append(surrounding_building)
+            corner_buildings_3D.append(inside_building)
+            height = height + random.choice([-3, 3])
+
+            # Delete the larger index first to avoid index shift issues
+            indices_to_remove = sorted([idx_outline_surrounding, idx_outline_inside], reverse=True)
+            for index in indices_to_remove:
+                for lst in [building_footprints, building_dist_sum]:
+                    del lst[index]
+
+        # Address rest of the buildings
+        # Sort lists according to buliding distance to edge sum
+        if len(building_footprints) > 0:
+            sorted_pairs = sorted(zip(building_dist_sum, building_footprints), key=lambda x: x[0], reverse=True)
+            building_dist_sum, building_footprints = zip(*sorted_pairs)
+            for footprint in building_footprints:           
+                footprint = rs.coercecurve(footprint)
+                footprint = clean_polyline(footprint)
+                corner_building = extrude_polyline(footprint, height)
+                corner_buildings_3D.append(corner_building)
+                rng = random.uniform(0,1)
+                if rng < 0.2:
+                    if height > 6:
+                        height = height - 6
+                else:
+                    if height > 3:
+                        height = height - 3
+
+    # Loop through all pentalateral corner parcels
+    for i, corner_parcel in enumerate(cp_penta_curves):
+        
+        # Extract vertices from pentalateral corner parcel
+        cp_polyline = corner_parcel.ToPolyline()
+        cp_vertices = list(cp_polyline.ToArray())
+
+        # Compute centroid
+        center = compute_centroid(cp_vertices)
+
+        # Generate a "grid" by subdividing the parcel through triangulation
+        cp_triangles, cp_indexed_points = generate_grid_in_pentalateral_parcel(cp_vertices, center)
+
+        # Initialize lists for 3D building creation
+        building_footprints = []
+        building_vertices = []
+        building_dist_sum = []
+        building_vertices_distance_to_edge = [[] for _ in range(len(cp_penta_building_map[i]))]   
+
+        # Loop through all buildings on parcel
+        for j in range(len(cp_penta_building_map[i])):
+            cp_building_indeces = cp_penta_building_map[i][j]
+            mapped_building_vertices = map_indices_to_points(cp_building_indeces, cp_indexed_points)
+
+            # Ensure the polyline is closed by appending the first vertex at the end if needed
+            if mapped_building_vertices[0].DistanceTo(mapped_building_vertices[-1]) > tolerance:
+                mapped_building_vertices.append(mapped_building_vertices[0])
+
+            # Create generic building footprint and append to generic building footprints
+            corner_building_outline = rs.AddPolyline(mapped_building_vertices)
+            corner_buildings_footprints.append(corner_building_outline)
+
+            # Measure distance of building footprints edges
+            corner_building_curve = rs.coercecurve(corner_building_outline)
+            building_footprints.append(corner_building_curve)
+            cb_vertices = corner_building_curve.ToPolyline().ToArray()
+            building_vertices.append(cb_vertices)
+            for vertex in cb_vertices:
+                dist_1 = round(vertex.DistanceTo(cp_vertices[0]), 2)
+                dist_2 = round(vertex.DistanceTo(cp_vertices[1]), 2)
+                building_vertices_distance_to_edge[j].append(dist_1)
+                building_vertices_distance_to_edge[j].append(dist_2)
+
+        # Distance from boundary edge for reasonable height distribution
+        for j in range(len(building_vertices_distance_to_edge)):
+            weighted_dist = sum(building_vertices_distance_to_edge[j]) / len(building_vertices_distance_to_edge[j])
+            dist_sum = round(weighted_dist ,2)
+            building_dist_sum.append(dist_sum)      
+
+        # Get a height from data package (or from the FAR calculation)
+        b_gauss_height = round(random.gauss(b_mean_height, b_height_std))
+        height = random.uniform(b_min_height, b_max_height) 
+
+        # Figure out if any footprint lies on another one
+        building_footprint_inside, idx_outline_inside, idx_outline_surrounding = check_building_footprints_inside(building_footprints, building_vertices, tolerance)
+
+        # Create corner building extrustions
+        # Address the buildings with the outline inside:
+        if building_footprint_inside == True:
+            surrounding_footprint = rs.coercecurve(building_footprints[idx_outline_surrounding])
+            surrounding_footprint = clean_polyline(surrounding_footprint)
+            inside_footprint = rs.coercecurve(building_footprints[idx_outline_inside])
+            inside_footprint = clean_polyline(inside_footprint)
+            surrounding_building = extrude_polyline(surrounding_footprint, height)
+            inside_building = extrude_polyline(inside_footprint, height + 6)
+            corner_buildings_3D.append(surrounding_building)
+            corner_buildings_3D.append(inside_building)
+            height = height + random.choice([-6, 6])
+
+            # Delete the larger index first to avoid index shift issues
+            indices_to_remove = sorted([idx_outline_surrounding, idx_outline_inside], reverse=True)
+            for index in indices_to_remove:
+                for lst in [building_footprints, building_dist_sum]:
+                    del lst[index]
+
+        # Address rest of the buildings
+        # Sort lists according to buliding distance to edge sum
+        if len(building_footprints) > 0:
+            sorted_pairs = sorted(zip(building_dist_sum, building_footprints), key=lambda x: x[0], reverse=True)
+            building_dist_sum, building_footprints = zip(*sorted_pairs)
+            for footprint in building_footprints:
+                footprint = rs.coercecurve(footprint)
+                footprint = clean_polyline(footprint)
+                corner_building = extrude_polyline(footprint, height)
+                corner_buildings_3D.append(corner_building)
+                rng = random.uniform(0,1)
+                if rng < 0.5:
+                    if height > 6:
+                        height = height - 6
+                else:
+                    if height > 6:
+                        height = height - 3
+
+    ################
+    """ OUTPUTS """
+
+    for gb_footprint in generic_buildings_footprints:
+        footprints.append(gb_footprint)
+    for cb_footprint in corner_buildings_footprints:
+        footprints.append(cb_footprint)
+    for gb_3D in generic_buildings_3D:
+        extrusions.append(gb_3D)
+    for cp_3D in corner_buildings_3D:
+        extrusions.append(cp_3D)
