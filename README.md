@@ -1,7 +1,7 @@
 # urbansculpt
 Urbansculpt workflow repository. 
 Stores component scripts and template files. 
-Software requirement: Rhino 8 / Python 3.9.10 (built-in Grasshopper component)
+Software requirement: Rhino 8 / Python 3.9.10 (built-in Grasshopper component on date 20.10.2024)
 
 Component Scripts:
 Component scripts are stored in two different folders.
