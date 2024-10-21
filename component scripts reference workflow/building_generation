@@ -58,7 +58,6 @@ def find_best_matches(dimensions_list, buildings_map, aspect_ratio_weight):
             available_buildings = original_buildings.copy()  # Reset to the original list
     return def_building_map
 
-
 # Function to extrude polyline to closed brep
 def extrude_polyline(polyline_curve, height):
     # Define tolerance
@@ -85,7 +84,6 @@ def extrude_polyline(polyline_curve, height):
             return capped_brep
         else:
             return brep
-
 
 # Function to check if any building footprint lies inside another and classify their relationship.
 def check_building_footprints_inside(building_footprints, building_vertices, tolerance):
@@ -120,7 +118,6 @@ def check_building_footprints_inside(building_footprints, building_vertices, tol
     # Return results (False if no footprint was found inside another), and ints for the indeces
     return building_footprint_inside, idx_outline_inside, idx_outline_surrounding
 
-
 # Clean mapped polyline if there are duplicate vertices
 def clean_polyline(polyline):
     # Get the list of vertices of the polyline
@@ -136,6 +133,25 @@ def clean_polyline(polyline):
     # Create a new polyline from the cleaned vertices
     cleaned_curve = rg.Polyline([v.Location for v in vertices]).ToNurbsCurve()
     return cleaned_curve
+
+# Function to perform boolean union on a list of Breps. 
+def union_breps(breps):
+    # If there's only one brep, return it directly
+    if len(breps) == 1:
+        return breps[0]
+    # Ensure valid Breps and a list with at least two breps
+    if len(breps) < 1:
+        return None
+    # Attempt to union the Breps
+    try:
+        union_result = rg.Brep.CreateBooleanUnion(breps, 0.001) # If succesful, CreateBoolenUnion returns an array of breps
+        if union_result is not None and len(union_result) > 0:
+            # Return the result as a list of Breps
+            return list(union_result)  # Convert the array to a list and return it
+        else:
+            return breps  # Return original Breps if union fails
+    except Exception as e:
+        return breps  # Return original Breps if exception occurs
 
 
 ### Functions used for quadrilateral building mapping ###
@@ -519,6 +535,9 @@ for i, boundary in enumerate(boundaries):
         b_gauss_height = round(random.gauss(b_mean_height, b_height_std))
         height = int(max(b_min_height, min(b_gauss_height, b_max_height)))
 
+        # Assign all Breps in a parcel to a list
+        breps_in_parcel = []
+
         # Create generic building extrustions
         # Address the buildings with the outline inside:
         if building_footprint_inside == True:
@@ -527,8 +546,10 @@ for i, boundary in enumerate(boundaries):
             inside_footprint = rs.coercecurve(building_footprints[idx_outline_inside])
             surrounding_building = extrude_polyline(surrounding_footprint, height)
             inside_building = extrude_polyline(inside_footprint, height + 3)
-            generic_buildings_3D.append(surrounding_building)
-            generic_buildings_3D.append(inside_building)
+            breps_in_parcel.append(surrounding_building)
+            breps_in_parcel.append(inside_building)
+            # generic_buildings_3D.append(surrounding_building)
+            # generic_buildings_3D.append(inside_building)
             height = height + random.choice([-3, 3])
 
             # Delete the larger index first to avoid index shift issues
@@ -545,7 +566,8 @@ for i, boundary in enumerate(boundaries):
             for footprint in building_footprints:      
                 footprint = rs.coercecurve(footprint)
                 generic_building = extrude_polyline(footprint, height)
-                generic_buildings_3D.append(generic_building)
+                breps_in_parcel.append(generic_building)
+                # generic_buildings_3D.append(generic_building)
                 rng = random.uniform(0,1)
                 if rng < 0.2:
                     if height > 6:
@@ -553,6 +575,17 @@ for i, boundary in enumerate(boundaries):
                 else:
                     if height > 3:
                         height = height - 3
+
+        # Boolean Union
+        unionized_brep = union_breps(breps_in_parcel)
+
+        # If the union returns a list, we must unpack the list and append individual Breps
+        if isinstance(unionized_brep, list):
+            for brep in unionized_brep:
+                generic_buildings_3D.append(brep)  # Append individual Breps, not lists
+        else:
+            # Otherwise, just append the single unionized Brep
+            generic_buildings_3D.append(unionized_brep)
 
 
 
@@ -618,6 +651,9 @@ for i, boundary in enumerate(boundaries):
         # Figure out if any footprint lies on another one
         building_footprint_inside, idx_outline_inside, idx_outline_surrounding = check_building_footprints_inside(building_footprints, building_vertices, tolerance)
 
+        # Assign all Breps in a parcel to a list
+        breps_in_parcel = []
+
         # Create corner building extrustions
         # Address the buildings with the outline inside:
         if building_footprint_inside == True:
@@ -627,8 +663,8 @@ for i, boundary in enumerate(boundaries):
             inside_footprint = clean_polyline(inside_footprint)
             surrounding_building = extrude_polyline(surrounding_footprint, height)
             inside_building = extrude_polyline(inside_footprint, height + 3)
-            corner_buildings_3D.append(surrounding_building)
-            corner_buildings_3D.append(inside_building)
+            breps_in_parcel.append(surrounding_building)
+            breps_in_parcel.append(inside_building)
             height = height + random.choice([-3, 3])
 
             # Delete the larger index first to avoid index shift issues
@@ -646,7 +682,7 @@ for i, boundary in enumerate(boundaries):
                 footprint = rs.coercecurve(footprint)
                 footprint = clean_polyline(footprint)
                 corner_building = extrude_polyline(footprint, height)
-                corner_buildings_3D.append(corner_building)
+                breps_in_parcel.append(corner_building)
                 rng = random.uniform(0,1)
                 if rng < 0.2:
                     if height > 6:
@@ -654,6 +690,18 @@ for i, boundary in enumerate(boundaries):
                 else:
                     if height > 3:
                         height = height - 3
+
+        # Boolean Union
+        unionized_brep = union_breps(breps_in_parcel)
+
+        # If the union returns a list, we must unpack the list and append individual Breps
+        if isinstance(unionized_brep, list):
+            for brep in unionized_brep:
+                generic_buildings_3D.append(brep)  # Append individual Breps, not lists
+        else:
+            # Otherwise, just append the single unionized Brep
+            corner_buildings_3D.append(unionized_brep)
+
 
     # Loop through all pentalateral corner parcels
     for i, corner_parcel in enumerate(cp_penta_curves):
@@ -698,6 +746,7 @@ for i, boundary in enumerate(boundaries):
                 building_vertices_distance_to_edge[j].append(dist_1)
                 building_vertices_distance_to_edge[j].append(dist_2)
 
+
         # Distance from boundary edge for reasonable height distribution
         for j in range(len(building_vertices_distance_to_edge)):
             weighted_dist = sum(building_vertices_distance_to_edge[j]) / len(building_vertices_distance_to_edge[j])
@@ -711,6 +760,9 @@ for i, boundary in enumerate(boundaries):
         # Figure out if any footprint lies on another one
         building_footprint_inside, idx_outline_inside, idx_outline_surrounding = check_building_footprints_inside(building_footprints, building_vertices, tolerance)
 
+        # Assign all Breps in a parcel to a list
+        breps_in_parcel = []
+
         # Create corner building extrustions
         # Address the buildings with the outline inside:
         if building_footprint_inside == True:
@@ -720,8 +772,8 @@ for i, boundary in enumerate(boundaries):
             inside_footprint = clean_polyline(inside_footprint)
             surrounding_building = extrude_polyline(surrounding_footprint, height)
             inside_building = extrude_polyline(inside_footprint, height + 6)
-            corner_buildings_3D.append(surrounding_building)
-            corner_buildings_3D.append(inside_building)
+            breps_in_parcel.append(surrounding_building)
+            breps_in_parcel.append(inside_building)
             height = height + random.choice([-6, 6])
 
             # Delete the larger index first to avoid index shift issues
@@ -739,14 +791,26 @@ for i, boundary in enumerate(boundaries):
                 footprint = rs.coercecurve(footprint)
                 footprint = clean_polyline(footprint)
                 corner_building = extrude_polyline(footprint, height)
-                corner_buildings_3D.append(corner_building)
+                breps_in_parcel.append(corner_building)
                 rng = random.uniform(0,1)
-                if rng < 0.5:
+                if rng < 0.2:
                     if height > 6:
                         height = height - 6
                 else:
                     if height > 6:
                         height = height - 3
+
+        # Boolean Union
+        unionized_brep = union_breps(breps_in_parcel)
+
+        # If the union returns a list, we must unpack the list and append individual Breps
+        if isinstance(unionized_brep, list):
+            for brep in unionized_brep:
+                generic_buildings_3D.append(brep)  # Append individual Breps, not lists
+        else:
+            # Otherwise, just append the single unionized Brep
+            corner_buildings_3D.append(unionized_brep)                        
+                    
 
     ################
     """ OUTPUTS """
